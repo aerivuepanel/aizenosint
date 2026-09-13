@@ -1,5 +1,3 @@
-
-
 import os
 import io
 import re
@@ -12,6 +10,7 @@ import secrets
 import asyncio
 import logging
 import socket
+import subprocess
 import dns.resolver
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime, timedelta, timezone
@@ -588,7 +587,20 @@ def schedule_message_delete(message, delay: int):
         asyncio.create_task(schedule_delete(message, delay))
 
 
-async def delete_user_search_message(update: Update):
+async def launch_update_restart() -> bool:
+    script = BASE_DIR / "update_restart.sh"
+    if not script.exists():
+        logger.error("Update script not found: %s", script)
+        return False
+    try:
+        subprocess.Popen(["/bin/bash", str(script)], cwd=str(BASE_DIR), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except Exception:
+        logger.exception("Failed to launch update/restart script")
+        return False
+
+
+def delete_user_search_message(update: Update):
     """Delete a user's search/input message after the configured short delay."""
     message = update.effective_message
     if not message or not message.from_user:
@@ -1119,7 +1131,8 @@ async def handle_tg(update, context, value):
         fmt_tg(data, lookup_value),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
-        reply_markup=keyboard
+        reply_markup=keyboard,
+        auto_delete_after=result_delete_seconds(),
     )
 
 async def handle_aadhar(update, context, value):
@@ -1179,10 +1192,10 @@ def _number_detail_keyboard(index, total, number, results):
 
         nav.append(
             modern_button(
-                f": {prev_id}",
+                f"⭐ ID: {prev_id}",
                 f"num_page:{index - 1}",
                 style="primary",
-                emoji_name="search"
+                emoji_name="premium"
             )
         )
 
@@ -1191,10 +1204,10 @@ def _number_detail_keyboard(index, total, number, results):
 
         nav.append(
             modern_button(
-                f": {next_id}",
+                f"⭐ ID: {next_id}",
                 f"num_page:{index + 1}",
                 style="primary",
-                emoji_name="search"
+                emoji_name="premium"
             )
         )
 
@@ -1313,7 +1326,8 @@ async def handle_num(update, context, value):
             fmt_number(data, number),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
-            reply_markup=back_keyboard()
+            reply_markup=back_keyboard(),
+            auto_delete_after=result_delete_seconds(),
         )
         return
 
@@ -1330,7 +1344,8 @@ async def handle_num(update, context, value):
         _format_number_detail(results[index], number, index, total),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
-        reply_markup=_number_detail_keyboard(index, total, number, results)
+        reply_markup=_number_detail_keyboard(index, total, number, results),
+        auto_delete_after=result_delete_seconds(),
     )
 
 async def handle_veh(update, context, value):
@@ -1544,13 +1559,13 @@ async def handle_darkweb(update, context, value):
         f"{ce('lock', '•')} No Tor crawling or credential/breach-dump access."
     )
     result = await safe_reply(update.effective_message, text, parse_mode=ParseMode.HTML)
-    schedule_message_delete(result, AUTO_DELETE_RESULT_SECONDS)
+    schedule_message_delete(result, result_delete_seconds())
 
 # =============================================================================
 # IMAGE FORENSICS
 # =============================================================================
 async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await delete_user_search_message(update)
+    delete_user_search_message(update)
     if await enforce_force_join(update):
         return
     if not update.message.photo:
@@ -1584,7 +1599,7 @@ async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"{ce('phone', '•')} <b>Device:</b> {esc(exif.get('Make', ''))} {esc(exif.get('Model', ''))}")
         await safe_edit_message(status, "\n".join(lines), parse_mode=ParseMode.HTML, auto_delete_after=result_delete_seconds())
     except Exception as e:
-        await safe_edit_message(status, f"• <b>Failed:</b> <code>{esc(str(e))}</code>", parse_mode=ParseMode.HTML)
+        await safe_edit_message(status, f"• <b>Failed:</b> <code>{esc(str(e))}</code>", parse_mode=ParseMode.HTML, auto_delete_after=result_delete_seconds())
 
 # =============================================================================
 # ADMIN PANEL
@@ -1615,6 +1630,9 @@ def admin_panel_keyboard():
         [
             modern_button("Find User", "admin_find", style="primary", emoji_name="search"),
             modern_button("System Info", "admin_system", style="primary", emoji_name="tools"),
+        ],
+        [
+            modern_button("Update & Restart", "admin_update_restart", style="success", emoji_name="tools"),
         ],
         [
             modern_button("Force Join", "admin_forcejoin", style="primary", emoji_name="shield"),
@@ -1971,6 +1989,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True,
             reply_markup=_number_detail_keyboard(index, len(results), number, results)
         )
+        schedule_message_delete(query.message, result_delete_seconds())
         return
 
     if data.startswith("num_json:"):
@@ -1990,10 +2009,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results,
             number
         )
-        clean_number = re.sub(r"\D", "", number)
+
         filename = (
             f"number_info_"
-            f"{clean_number}"
+            f"{re.sub(r'\\D', '', number)}"
             f"_all.json"
         )
 
@@ -2273,6 +2292,20 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, dat
                 f"{ce('search', '•')} <b>FIND USER</b>\n\nSend user ID or @username.\nSend /cancel to abort.",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[modern_button("Cancel", "admin_panel", style="danger", emoji_name="lock")]]))
+        elif data == "admin_update_restart":
+            started = launch_update_restart()
+            if started:
+                await safe_edit(
+                    q,
+                    f"{ce('tools', '•')} <b>UPDATE &amp; RESTART</b>\n\n"
+                    f"GitHub update has started.\n"
+                    f"The bot will restart automatically after the update.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=admin_back_keyboard(),
+                )
+            else:
+                await q.answer("Update script not found or could not start.", show_alert=True)
+
         elif data == "admin_system":
             import platform
             text = (
@@ -2353,10 +2386,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message or not update.effective_message.text:
         return
     text = update.effective_message.text.strip()
-
-    # User input is ephemeral. Admin workflow messages are kept intact.
-    if not is_admin(update.effective_user.id):
-        await delete_user_search_message(update)
 
     # Admin delete timer mode
     if context.user_data.get("admin_delete_timer_mode"):
@@ -2455,10 +2484,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_forcejoin_text_handler(update, context)
         return
 
-    # Pending module
+    # Pending module: ONLY this input is ephemeral.
+    # Ordinary text is never deleted.
     module = context.user_data.get("pending_module")
     if not module:
         return
+    if not is_admin(update.effective_user.id):
+        delete_user_search_message(update)
     context.user_data.pop("pending_module", None)
 
     if await enforce_force_join(update):
@@ -2521,7 +2553,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply(update.message, home_text(user), parse_mode=ParseMode.HTML, reply_markup=main_keyboard(user))
 
 async def cmd_tg(update, context):
-    await delete_user_search_message(update)
+    delete_user_search_message(update)
     if await enforce_force_join(update): return
     if not context.args:
         await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/tg 9876543210</code> or <code>/tg @username</code>", parse_mode=ParseMode.HTML)
@@ -2529,7 +2561,7 @@ async def cmd_tg(update, context):
     await handle_tg(update, context, " ".join(context.args))
 
 async def cmd_aadhar(update, context):
-    await delete_user_search_message(update)
+    delete_user_search_message(update)
     if await enforce_force_join(update): return
     if not context.args:
         await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/aadhar 123456789012</code>", parse_mode=ParseMode.HTML)
@@ -2537,7 +2569,7 @@ async def cmd_aadhar(update, context):
     await handle_aadhar(update, context, " ".join(context.args))
 
 async def cmd_num(update, context):
-    await delete_user_search_message(update)
+    delete_user_search_message(update)
     if await enforce_force_join(update): return
     if not context.args:
         await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/num 9876543210</code>", parse_mode=ParseMode.HTML)
@@ -2545,7 +2577,7 @@ async def cmd_num(update, context):
     await handle_num(update, context, " ".join(context.args))
 
 async def cmd_veh(update, context):
-    await delete_user_search_message(update)
+    delete_user_search_message(update)
     if await enforce_force_join(update): return
     if not context.args:
         await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/veh UP63AS0001</code>", parse_mode=ParseMode.HTML)
@@ -2553,7 +2585,7 @@ async def cmd_veh(update, context):
     await handle_veh(update, context, " ".join(context.args))
 
 async def cmd_user(update, context):
-    await delete_user_search_message(update)
+    delete_user_search_message(update)
     if await enforce_force_join(update): return
     if not context.args:
         await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/user username</code>", parse_mode=ParseMode.HTML)
@@ -2561,7 +2593,7 @@ async def cmd_user(update, context):
     await handle_user(update, context, " ".join(context.args))
 
 async def cmd_target(update, context):
-    await delete_user_search_message(update)
+    delete_user_search_message(update)
     if await enforce_force_join(update): return
     if not context.args:
         await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/target domain.com</code>", parse_mode=ParseMode.HTML)
@@ -2569,7 +2601,7 @@ async def cmd_target(update, context):
     await handle_target(update, context, " ".join(context.args))
 
 async def cmd_email(update, context):
-    await delete_user_search_message(update)
+    delete_user_search_message(update)
     if await enforce_force_join(update): return
     if not context.args:
         await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/email name@example.com</code>", parse_mode=ParseMode.HTML)
@@ -2577,7 +2609,7 @@ async def cmd_email(update, context):
     await handle_email(update, context, " ".join(context.args))
 
 async def cmd_darkweb(update, context):
-    await delete_user_search_message(update)
+    delete_user_search_message(update)
     if await enforce_force_join(update): return
     if not context.args:
         await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/darkweb query</code>", parse_mode=ParseMode.HTML)
@@ -2608,7 +2640,7 @@ async def cmd_cancel(update, context):
 # ERROR HANDLER
 # =============================================================================
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update caused error: {context.error}")
+    logger.exception("Update caused error")
     if update and update.effective_message:
         try:
             await update.effective_message.reply_text("• <b>An error occurred.</b>", parse_mode=ParseMode.HTML)
