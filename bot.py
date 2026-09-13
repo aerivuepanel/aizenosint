@@ -1179,7 +1179,7 @@ def _number_detail_keyboard(index, total, number, results):
 
         nav.append(
             modern_button(
-                f"⭐ ID: {prev_id}",
+                f"prev: {prev_id}",
                 f"num_page:{index - 1}",
                 style="primary",
                 emoji_name="premium"
@@ -1191,7 +1191,7 @@ def _number_detail_keyboard(index, total, number, results):
 
         nav.append(
             modern_button(
-                f"⭐ ID: {next_id}",
+                f"next: {next_id}",
                 f"num_page:{index + 1}",
                 style="primary",
                 emoji_name="premium"
