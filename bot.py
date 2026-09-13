@@ -1179,10 +1179,10 @@ def _number_detail_keyboard(index, total, number, results):
 
         nav.append(
             modern_button(
-                f"prev: {prev_id}",
+                f": {prev_id}",
                 f"num_page:{index - 1}",
                 style="primary",
-                emoji_name="premium"
+                emoji_name="search"
             )
         )
 
@@ -1191,10 +1191,10 @@ def _number_detail_keyboard(index, total, number, results):
 
         nav.append(
             modern_button(
-                f"next: {next_id}",
+                f": {next_id}",
                 f"num_page:{index + 1}",
                 style="primary",
-                emoji_name="premium"
+                emoji_name="search"
             )
         )
 
