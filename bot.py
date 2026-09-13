@@ -2009,10 +2009,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results,
             number
         )
-
+        clean_number = re.sub(r"\D", "", number)
         filename = (
             f"number_info_"
-            f"{re.sub(r'\\D', '', number)}"
+            f"{clean_number}"
             f"_all.json"
         )
 
