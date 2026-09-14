@@ -8,6 +8,7 @@ import html
 import hashlib
 import secrets
 import asyncio
+import time
 import logging
 import socket
 import subprocess
@@ -17,8 +18,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+
+import phonenumbers
+from phonenumbers import NumberParseException
+
 import aiohttp
 from dotenv import load_dotenv
+from html import escape as html_escape
 from PIL import Image, ExifTags
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -50,7 +56,7 @@ handler.setFormatter(ColoredFormatter(
     "%(asctime)s | %(levelname)s | %(name)s | %(message)s", datefmt="%H:%M:%S"
 ))
 logging.basicConfig(level=logging.INFO, handlers=[handler])
-logger = logging.getLogger("DEMON_OSINT")
+logger = logging.getLogger("AizenOSINT")
 
 load_dotenv()
 
@@ -283,24 +289,37 @@ async def safe_edit(query, text, **kwargs):
     except BadRequest as e:
         error = str(e).lower()
 
+        # Message already has the same content
         if "message is not modified" in error or "not modified" in error:
             return None
 
-        if "can't parse entities" in error or \
-           "entity_text_invalid" in error or \
-           "can't find end tag" in error or \
-           "unsupported start tag" in error:
+        # Message was deleted / cannot be edited anymore
+        if (
+            "message to edit not found" in error
+            or "message can't be edited" in error
+            or "message is not found" in error
+        ):
+            return None
 
+        # Invalid HTML/entities -> retry without parse_mode
+        if (
+            "can't parse entities" in error
+            or "entity_text_invalid" in error
+            or "can't find end tag" in error
+            or "unsupported start tag" in error
+        ):
             clean_kwargs = dict(kwargs)
             clean_kwargs.pop("parse_mode", None)
 
-            return await query.edit_message_text(
-                clean_html(text),
-                **clean_kwargs
-            )
+            try:
+                return await query.edit_message_text(
+                    clean_html(text),
+                    **clean_kwargs
+                )
+            except BadRequest:
+                return None
 
         raise
-
 
 def help_text(user=None) -> str:
     premium = is_premium_user(user) if user else False
@@ -490,15 +509,54 @@ def consume_search(user, unlimited=False, module="unknown", target=""):
             allowed = False
     if not allowed:
         return False
+
     user["total_searches"] = int(user.get("total_searches", 0)) + 1
+    search_id = secrets.token_hex(8)
     DB.setdefault("searches", []).append({
-        "user_id": user.get("id"), "module": module,
-        "target": str(target)[:200], "created_at": now_iso(),
+        "id": search_id,
+        "user_id": user.get("id"),
+        "module": module,
+        "target": str(target)[:200],
+        "created_at": now_iso(),
+        "result": None,
     })
+    # Keep the JSON database bounded. Older records are removed first.
     if len(DB["searches"]) > 10000:
         DB["searches"] = DB["searches"][-10000:]
+    user["last_search_id"] = search_id
     save_db(DB)
     return True
+
+def save_search_result(user, result_text):
+    """Attach the final rendered result to the user's most recent search record."""
+    search_id = user.get("last_search_id") if user else None
+    if not search_id:
+        return
+    text = str(result_text or "")
+    # Stored history is intentionally bounded so database.json cannot grow without limit.
+    if len(text) > 12000:
+        text = text[:12000] + "\n\n• Result truncated in history."
+    for item in reversed(DB.get("searches", [])):
+        if item.get("id") == search_id and item.get("user_id") == user.get("id"):
+            item["result"] = text
+            item["completed_at"] = now_iso()
+            save_db(DB)
+            return
+
+def user_search_history(user_id, limit=None):
+    rows = [x for x in DB.get("searches", []) if str(x.get("user_id")) == str(user_id)]
+    rows.reverse()
+    if limit:
+        rows = rows[:limit]
+    return rows
+
+def search_module_label(module):
+    return {
+        "tg": "TG Info", "aadhar": "Aadhaar", "num": "Number OSINT",
+        "veh": "Vehicle Info", "imei": "IMEI Info", "user": "Username Recon",
+        "target": "Network Intel", "email": "Email Intel",
+        "darkweb": "Dark Web Demo", "image": "Image Forensics",
+    }.get(module, str(module or "Unknown").title())
 
 def search_gate(update, module="unknown", target=""):
     user = ensure_user(update.effective_user)
@@ -709,19 +767,19 @@ def main_keyboard(user=None):
     rows = [
         [
             modern_button("TG Info", "mod_tg", style="primary", emoji_name="user"),
-            modern_button("Aadhaar", "mod_aadhar", style="primary", emoji_name="id"),
+            modern_button("Username Recon", "mod_user", style="primary", emoji_name="id"),
         ],
         [
             modern_button("Number OSINT", "mod_num", style="primary", emoji_name="phone"),
             modern_button("Vehicle Info", "mod_veh", style="primary", emoji_name="car"),
-            modern_button("IMEI Info", "mod_imei", style="primary", emoji_name="phone"),
         ],
         [
-            modern_button("Username Recon", "mod_user", style="primary", emoji_name="search"),
+            modern_button("Aadhaar", "mod_aadhar", style="primary", emoji_name="id"),
             modern_button("Network Intel", "mod_target", style="primary", emoji_name="network"),
         ],
         [
             modern_button("Email Intel", "mod_email", style="primary", emoji_name="verified"),
+            modern_button("IMEI Info", "mod_imei", style="primary", emoji_name="phone"),
         ],
         [
             modern_button("Image Forensics", "mod_image", style="primary", emoji_name="tools"),
@@ -732,7 +790,10 @@ def main_keyboard(user=None):
             modern_button("Refer & Earn", "refer", style="success", emoji_name="gift"),
         ],
         [
+            modern_button("My Searches", "my_searches:0", style="primary", emoji_name="search"),
             modern_button("Statistics", "stats", style="primary", emoji_name="analytics"),
+        ],
+        [
             modern_button("Help", "help", style="danger", emoji_name="shield"),
         ],
     ]
@@ -773,7 +834,7 @@ def home_text(user=None):
     referrals = len(user.get("referrals", []))
     group_mode = "Unlimited in configured group" if FREE_GROUP_ID else "Standard limits"
     return (
-        f'<tg-emoji emoji-id="5467641505525016018">⭐</tg-emoji> <b>AizenOSINT BOT v1.0</b>\n\n'
+        f'<tg-emoji emoji-id="5467641505525016018">⭐</tg-emoji> <b>AizenOSINT BOT v2.0</b>\n\n'
         f"{ce('diamond')} <b>Modern • Fast • Modular</b>\n"
         f"{ce('shield')} Authorized security research only.\n\n"
         f"{ce('search')} <b>Available Modules:</b>\n"
@@ -813,7 +874,7 @@ async def show_profile(update, edit=True):
 async def show_referral(update, edit=True):
     user = ensure_user(update.effective_user)
     code = user["ref_code"]
-    link = f"https://t.me/{BOT_USERNAME}?start={code}" if BOT_USERNAME else f"https://t.me/YOUR_BOT?start={code}"
+    link = f"https://t.me/{BOT_USERNAME}?start={code}" if BOT_USERNAME else f"https://t.me/shownxaizenbot?start={code}"
     text = (
         f"{ce('gift', '•')} <b>REFERRAL CENTER</b>\n\n"
         f"{ce('users', '•')} <b>Your referrals:</b> {len(user.get('referrals', []))}\n"
@@ -1036,12 +1097,12 @@ def fmt_imei(data: dict, imei: str) -> str:
 # MODULE NAMES
 # =============================================================================
 MODULE_NAMES = {
-    "tg": ("TG Number Info", "Send telgram user id: (e.g. 9876543210) or username: (e.g. @username)"),
+    "tg": ("TG Number Info", "Send telgram user id: (e.g. 1810011559) or username: (e.g. @Kishan_x_73)"),
     "aadhar": ("Aadhaar Info", "Send a 12-digit Aadhaar number"),
-    "num": ("Number Lookup", "Send a 10-digit mobile number"),
+    "num": ("Number Lookup", "Send a mobile number"),
     "veh": ("Vehicle Info", "Send a registration number (e.g. UP63AS0001)"),
     "imei": ("IMEI Info", "Send a 15-digit IMEI number (e.g. 353010111111110)"),
-    "user": ("Username Recon", "Send a username to scan platforms"),
+    "user": ("Username Recon", "Send a username to scan platforms (e.g. elonmusk)"),
     "target": ("Network Intel", "Send a domain or IP"),
     "email": ("Email Intel", "Send an email address"),
     "image": ("Image Forensics", "Upload a photo directly"),
@@ -1065,75 +1126,511 @@ def _pending_prompt(module: str) -> str:
 # =============================================================================
 # MODULE HANDLERS
 # =============================================================================
-async def handle_tg(update, context, value):
-    value = value.strip()
 
-    # @username OR numeric Telegram user ID
+
+
+# ============================================================
+# TG FORMATTERS
+# ============================================================
+
+def _tg_value(value, default="N/A"):
+    """Safely format API values for Telegram HTML."""
+    if value is None or value == "":
+        return default
+
+    if isinstance(value, (dict, list)):
+        value = str(value)
+
+    return html_escape(str(value))
+
+
+def _tg_extract(data: dict) -> dict:
+    """Safely extract first Telegram result from API response."""
+    if not isinstance(data, dict):
+        return {}
+
+    response = data.get("response")
+
+    if not isinstance(response, dict):
+        return {}
+
+    results = response.get("data")
+
+    if not isinstance(results, list) or not results:
+        return {}
+
+    first = results[0]
+
+    return first if isinstance(first, dict) else {}
+
+
+def fmt_tg(data: dict, lookup_value: str = "") -> str:
+    """
+    Premium Telegram result formatter.
+
+    Only data is shown here.
+    No credits / promotional footer.
+    """
+
+    r = _tg_extract(data)
+
+    if not r:
+        return (
+            f"{ce('search', '•')} <b>Telegram Search</b>\n"
+            f"\n"
+            f"{ce('warning', '•')} <b>No matching data found</b>\n"
+            f"{ce('info', '•')} Try checking the username or ID and search again."
+        )
+
+    user_id = _tg_value(r.get("user_id"))
+    number = _tg_value(r.get("number"))
+    country_code = _tg_value(r.get("country_code"))
+    country = _tg_value(r.get("country"))
+
+    return "\n".join([
+        f"{ce('user', '•')} <b>TELEGRAM PROFILE</b>",
+        "",
+        f"{ce('id', '•')} <b>User ID</b>  <code>{user_id}</code>",
+        f"{ce('phone', '•')} <b>Number</b>  <code>{number}</code>",
+        f"{ce('global', '•')} <b>Country Code</b>  <code>{country_code}</code>",
+        f"{ce('globe', '•')} <b>Country</b>  {country}",
+    ])
+
+
+# ============================================================
+# SEARCH UI
+# ============================================================
+
+TG_SEARCH_FRAMES = [
+    (
+        "search",
+        "<b>Telegram Search</b>",
+        "Initializing secure lookup..."
+    ),
+    (
+        "bolt",
+        "<b>Telegram Search</b>",
+        "Resolving Telegram identifier..."
+    ),
+    (
+        "global",
+        "<b>Telegram Search</b>",
+        "Querying available records..."
+    ),
+    (
+        "analytics",
+        "<b>Telegram Search</b>",
+        "Processing response..."
+    ),
+]
+
+
+def tg_search_message(frame: int, elapsed: float, target: str) -> str:
+    """
+    Generate animated Telegram search message.
+
+    Uses premium/custom emoji through ce().
+    No fake percentages.
+    """
+
+    icon_name, title, status = TG_SEARCH_FRAMES[
+        frame % len(TG_SEARCH_FRAMES)
+    ]
+
+    seconds = max(0.0, elapsed)
+
+    return (
+        f"{ce(icon_name, '•')} {title}\n"
+        f"\n"
+        f"   {ce('user', '•')} <b>Target</b>  "
+        f"<code>{_tg_value(target)}</code>\n"
+        f"\n"
+        f"   {ce('search', '•')} {status}\n"
+        f"   {ce('speed', '•')} <code>{seconds:.1f}s</code>"
+    )
+
+
+# ============================================================
+# SEARCH ANIMATION
+# ============================================================
+
+async def animate_tg_search(status_message, target: str):
+    """
+    Animate the Telegram search message.
+
+    Returns:
+        (stop_event, task, started)
+    """
+
+    stop_event = asyncio.Event()
+    started = time.monotonic()
+
+    async def _runner():
+        frame = 0
+
+        while not stop_event.is_set():
+            elapsed = time.monotonic() - started
+
+            text = tg_search_message(
+                frame=frame,
+                elapsed=elapsed,
+                target=target,
+            )
+
+            try:
+                await safe_edit_message(
+                    status_message,
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                # Animation failure must never kill lookup.
+                pass
+
+            frame += 1
+
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=1.15
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    task = asyncio.create_task(_runner())
+
+    return stop_event, task, started
+
+
+# ============================================================
+# RESULT STATES
+# ============================================================
+
+def tg_no_data_message(target: str, elapsed: float) -> str:
+    return (
+        f"{ce('search', '•')} <b>Telegram Search</b>\n"
+        f"\n"
+        f"   {ce('user', '•')} <b>Target</b>  "
+        f"<code>{_tg_value(target)}</code>\n"
+        f"\n"
+        f"   {ce('shield', '•')} <b>No matching data found</b>\n"
+        f"\n"
+        f"   <i>The lookup completed, but no usable record was returned.</i>\n"
+        f"\n"
+        f"   {ce('speed', '•')} <code>{elapsed:.2f}s</code>\n"
+        f"\n"
+        f"   {ce('tools', '•')} Need API access? Contact "
+        f"<b>@aerivue</b>"
+    )
+
+
+def tg_error_message(target: str, elapsed: float) -> str:
+    return (
+        f"{ce('security', '•')} <b>Telegram Search</b>\n"
+        f"\n"
+        f"   {ce('user', '•')} <b>Target</b>  "
+        f"<code>{_tg_value(target)}</code>\n"
+        f"\n"
+        f"   {ce('shield', '•')} <b>Lookup failed</b>\n"
+        f"   <i>The API did not return a valid response.</i>\n"
+        f"\n"
+        f"   {ce('speed', '•')} <code>{elapsed:.2f}s</code>\n"
+        f"\n"
+        f"   {ce('tools', '•')} Please try again later."
+    )
+
+# ============================================================
+# TELEGRAM HANDLER
+# ============================================================
+
+async def handle_tg(update, context, value):
+    value = (value or "").strip()
+
+    if not value:
+        await safe_reply(
+            update.effective_message,
+            (
+                f"{ce('warning', '•')} "
+                f"<b>Telegram username or ID is required.</b>\n"
+                f"\n"
+                f"Example: <code>@username</code>"
+            ),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # --------------------------------------------------------
+    # NORMALIZE INPUT
+    # --------------------------------------------------------
+
     if value.startswith("@"):
-        lookup_value = value
+        username = value[1:].strip()
+
+        if not re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]{4,31}",
+            username
+        ):
+            await safe_reply(
+                update.effective_message,
+                (
+                    f"{ce('warning', '•')} "
+                    f"<b>Invalid Telegram username.</b>\n"
+                    f"\n"
+                    f"Use something like "
+                    f"<code>@username</code>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        lookup_value = f"@{username}"
+
     elif value.isdigit():
         lookup_value = value
-    elif re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", value):
-        lookup_value = "@" + value
+
+    elif re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9_]{4,31}",
+        value
+    ):
+        lookup_value = f"@{value}"
+
     else:
         await safe_reply(
             update.effective_message,
-            f"{ce('lock', '•')} <b>Invalid Telegram username/ID.</b>\n"
-            f"Use <code>1234567890</code> or <code>@username</code>",
-            parse_mode=ParseMode.HTML
+            (
+                f"{ce('warning', '•')} "
+                f"<b>Invalid Telegram username / ID.</b>\n"
+                f"\n"
+                f"Use:\n"
+                f"• <code>1234567890</code>\n"
+                f"• <code>@username</code>"
+            ),
+            parse_mode=ParseMode.HTML,
         )
         return
+
+    # --------------------------------------------------------
+    # SEARCH GATE
+    # --------------------------------------------------------
 
     user, allowed, reason = search_gate(
         update,
         module="tg",
-        target=lookup_value
+        target=lookup_value,
     )
 
     if not allowed:
+        if reason == "banned":
+            message = (
+                f"🔒 <b>Access Restricted</b>\n"
+                f"\n"
+                f"Your account is currently not allowed "
+                f"to use this search."
+            )
+        else:
+            message = (
+                f"⏳ <b>Daily Limit Reached</b>\n"
+                f"\n"
+                f"You've reached today's Telegram search limit.\n"
+                f"Please try again later."
+            )
+
         await safe_reply(
             update.effective_message,
-            f"{ce('lock', '•')} <b>"
-            f"{'Banned.' if reason == 'banned' else 'Daily limit reached.'}"
-            f"</b>",
-            parse_mode=ParseMode.HTML
+            message,
+            parse_mode=ParseMode.HTML,
         )
         return
 
+    # --------------------------------------------------------
+    # INITIAL SEARCH MESSAGE
+    # --------------------------------------------------------
+
+    started = time.monotonic()
+
     status = await safe_reply(
         update.effective_message,
-        f"{ce('search', '•')} <b>Searching...</b>",
-        parse_mode=ParseMode.HTML
+        tg_search_message(
+            frame=0,
+            elapsed=0,
+            target=lookup_value,
+        ),
+        parse_mode=ParseMode.HTML,
     )
 
-    data = await lookup_tg(lookup_value)
+    # --------------------------------------------------------
+    # START ANIMATION
+    # --------------------------------------------------------
 
-    number = (
-        data.get("response", {})
-            .get("data", [{}])[0]
-            .get("number")
+    stop_animation = asyncio.Event()
+
+    async def search_animation():
+        frame = 0
+
+        while not stop_animation.is_set():
+            elapsed = time.monotonic() - started
+
+            try:
+                await safe_edit_message(
+                    status,
+                    tg_search_message(
+                        frame=frame,
+                        elapsed=elapsed,
+                        target=lookup_value,
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                pass
+
+            frame += 1
+
+            try:
+                await asyncio.wait_for(
+                    stop_animation.wait(),
+                    timeout=1.15,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    animation_task = asyncio.create_task(
+        search_animation()
+    )
+
+    # --------------------------------------------------------
+    # API LOOKUP
+    # --------------------------------------------------------
+
+    try:
+        data = await lookup_tg(lookup_value)
+
+    except asyncio.CancelledError:
+        stop_animation.set()
+
+        try:
+            await animation_task
+        except Exception:
+            pass
+
+        raise
+
+    except Exception:
+        elapsed = time.monotonic() - started
+
+        stop_animation.set()
+
+        try:
+            await animation_task
+        except Exception:
+            pass
+
+        error_text = tg_error_message(
+            lookup_value,
+            elapsed,
+        )
+
+        await safe_edit_message(
+            status,
+            error_text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            auto_delete_after=result_delete_seconds(),
+        )
+        return
+
+    # --------------------------------------------------------
+    # STOP ANIMATION
+    # --------------------------------------------------------
+
+    stop_animation.set()
+
+    try:
+        await animation_task
+    except Exception:
+        pass
+
+    elapsed = time.monotonic() - started
+
+    # --------------------------------------------------------
+    # PARSE RESPONSE SAFELY
+    # --------------------------------------------------------
+
+    result = _tg_extract(data)
+
+    number = result.get("number")
+
+    if number is not None:
+        number = str(number).strip()
+
+    # --------------------------------------------------------
+    # NO DATA
+    # --------------------------------------------------------
+
+    if not result:
+        history_result = tg_no_data_message(
+            lookup_value,
+            elapsed,
+        )
+
+        save_search_result(
+            user,
+            history_result,
+        )
+
+        await safe_edit_message(
+            status,
+            history_result,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            auto_delete_after=result_delete_seconds(),
+        )
+        return
+
+    # --------------------------------------------------------
+    # BUILD RESULT
+    # --------------------------------------------------------
+
+    result_text = fmt_tg(
+        data,
+        lookup_value,
     )
 
     keyboard = None
 
     if number:
-        # Use modern_button so the custom emoji/icon is applied consistently.
-        keyboard = deep_analysis_keyboard(str(number))
-        # Preserve the Telegram result so Back can return here without another TG lookup.
+        keyboard = deep_analysis_keyboard(number)
+
         context.user_data["last_tg_result"] = {
-            "text": fmt_tg(data, lookup_value),
+            "text": result_text,
             "lookup_value": lookup_value,
-            "number": str(number),
+            "number": number,
         }
+
+    # --------------------------------------------------------
+    # SAVE HISTORY
+    # --------------------------------------------------------
+
+    save_search_result(
+        user,
+        result_text,
+    )
+
+    # --------------------------------------------------------
+    # FINAL RESULT
+    # --------------------------------------------------------
 
     await safe_edit_message(
         status,
-        fmt_tg(data, lookup_value),
+        result_text,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
         reply_markup=keyboard,
         auto_delete_after=result_delete_seconds(),
     )
+
+
 
 async def handle_aadhar(update, context, value):
     aadhaar = re.sub(r'\D', '', value)
@@ -1146,7 +1643,9 @@ async def handle_aadhar(update, context, value):
         return
     status = await safe_reply(update.effective_message, f"{ce('search', '•')} <b>Searching...</b>", parse_mode=ParseMode.HTML)
     data = await lookup_aadhaar(aadhaar)
-    await safe_edit_message(status, fmt_aadhaar(data, aadhaar), parse_mode=ParseMode.HTML, disable_web_page_preview=True, auto_delete_after=result_delete_seconds())
+    history_result = fmt_aadhaar(data, aadhaar)
+    save_search_result(user, history_result)
+    await safe_edit_message(status, history_result, parse_mode=ParseMode.HTML, disable_web_page_preview=True, auto_delete_after=result_delete_seconds())
 
 
 def _number_results(data: dict) -> list:
@@ -1192,10 +1691,10 @@ def _number_detail_keyboard(index, total, number, results):
 
         nav.append(
             modern_button(
-                f"⭐ ID: {prev_id}",
+                f": {prev_id}",
                 f"num_page:{index - 1}",
                 style="primary",
-                emoji_name="premium"
+                emoji_name="search"
             )
         )
 
@@ -1204,10 +1703,10 @@ def _number_detail_keyboard(index, total, number, results):
 
         nav.append(
             modern_button(
-                f"⭐ ID: {next_id}",
+                f": {next_id}",
                 f"num_page:{index + 1}",
                 style="primary",
-                emoji_name="premium"
+                emoji_name="search"
             )
         )
 
@@ -1292,6 +1791,117 @@ def _number_download_payload(results, number):
         "results": details
     }
 
+
+def normalize_phone_number(value):
+    """
+    Normalize international phone numbers.
+
+    Supports:
+    +919876543210
+    919876543210
+    00919876543210
+    +44 7911 123456
+    (1) 202-555-0123
+
+    Returns:
+        {
+            "input": original input,
+            "e164": "+919876543210",
+            "national": "9876543210",
+            "country_code": "91",
+            "country": "India",
+            "region": "IN",
+            "valid": True
+        }
+    """
+
+    original = str(value).strip()
+
+    # Remove common formatting characters
+    cleaned = re.sub(r"[^\d+]", "", original)
+
+    # Convert 00XXXXXXXX → +XXXXXXXX
+    if cleaned.startswith("00"):
+        cleaned = "+" + cleaned[2:]
+
+    # International number
+    if cleaned.startswith("+"):
+        parse_value = cleaned
+    else:
+        # Treat number without + as international.
+        parse_value = "+" + cleaned
+
+    try:
+        parsed = phonenumbers.parse(parse_value, None)
+    except NumberParseException:
+        return None
+
+    if not phonenumbers.is_possible_number(parsed):
+        return None
+
+    # E.164 canonical format
+    e164 = phonenumbers.format_number(
+        parsed,
+        phonenumbers.PhoneNumberFormat.E164
+    )
+
+    # National number without country code
+    national = str(parsed.national_number)
+
+    country_code = str(parsed.country_code)
+
+    region = phonenumbers.region_code_for_number(parsed) or "Unknown"
+
+    country = (
+        phonenumbers.geocoder.country_name_for_number(parsed, "en")
+        or region
+        or "Unknown"
+    )
+
+    return {
+        "input": original,
+        "e164": e164,
+        "national": national,
+        "country_code": country_code,
+        "country": country,
+        "region": region,
+        "valid": phonenumbers.is_valid_number(parsed),
+    }
+
+
+# ─────────────────────────────────────────────
+# NUMBER SEARCH — ANIMATED PROGRESS UI (premium emoji, never resets/loops back)
+# ─────────────────────────────────────────────
+
+SEARCH_STAGES = [
+    ("security", "SCANNING", "Initializing intelligence engine..."),
+    ("security", "SCANNING", "Resolving number intelligence..."),
+    ("database", "QUERYING", "Querying available records..."),
+    ("database", "CORRELATING", "Correlating intelligence data..."),
+    ("speed", "PROCESSING", "Processing intelligence results..."),
+    ("speed", "FINALIZING", "Finalizing intelligence report..."),
+]
+SEARCH_BAR_LEN = 10
+
+
+def _search_frame(number, tick):
+    icon_key, label, subtext = SEARCH_STAGES[tick % len(SEARCH_STAGES)]
+    # Bar fills left-to-right and caps just short of full so it never visibly
+    # completes or resets mid-scan — only the real result replaces this frame.
+    filled = min(tick + 1, SEARCH_BAR_LEN - 1)
+    bar = "▰" * filled + "▱" * (SEARCH_BAR_LEN - filled)
+
+    return (
+        f"{ce('search', '⌕')} <b>NUMBER INTELLIGENCE</b>\n"
+        f"<code>━━━━━━━━━━━━━━━━━━━━</code>\n\n"
+        f"{ce('target', '•')} <b>TARGET</b>\n"
+        f"<code>{esc(number)}</code>\n\n"
+        f"{ce(icon_key, '•')} <b>{label}</b>\n"
+        f"<code>{bar}</code>\n\n"
+        f"<i>{subtext}</i>"
+    )
+
+
 async def handle_num(update, context, value):
     number = re.sub(r'\D', '', value)
     if len(number) < 10:
@@ -1313,17 +1923,59 @@ async def handle_num(update, context, value):
 
     status = await safe_reply(
         update.effective_message,
-        f"{ce('search', '🔎')} <b>Number Info: searching...</b>",
-        parse_mode=ParseMode.HTML
+        _search_frame(number, 0),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
-    data = await lookup_number(number)
+    # ─────────────────────────────────────────────
+    # SEARCH ANIMATION
+    # ─────────────────────────────────────────────
+
+    async def animate_search():
+        tick = 1
+        try:
+            while True:
+                await asyncio.sleep(1.15)
+                await safe_edit_message(
+                    status,
+                    _search_frame(number, tick),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+                tick += 1
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+
+    animation_task = asyncio.create_task(animate_search())
+
+    # ─────────────────────────────────────────────
+    # ACTUAL LOOKUP
+    # ─────────────────────────────────────────────
+
+    try:
+        data = await lookup_number(number)
+    finally:
+        animation_task.cancel()
+        try:
+            await animation_task
+        except asyncio.CancelledError:
+            pass
+
+    # ─────────────────────────────────────────────
+    # PROCESS RESULTS
+    # ─────────────────────────────────────────────
+
     results = _number_results(data)
 
     if not results:
+        history_result = fmt_number(data, number)
+        save_search_result(user, history_result)
         await safe_edit_message(
             status,
-            fmt_number(data, number),
+            history_result,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=back_keyboard(),
@@ -1339,9 +1991,11 @@ async def handle_num(update, context, value):
     index = 0
     total = len(results)
 
+    history_result = _format_number_detail(results[index], number, index, total)
+    save_search_result(user, history_result)
     await safe_edit_message(
         status,
-        _format_number_detail(results[index], number, index, total),
+        history_result,
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
         reply_markup=_number_detail_keyboard(index, total, number, results),
@@ -1359,7 +2013,9 @@ async def handle_veh(update, context, value):
         return
     status = await safe_reply(update.effective_message, f"{ce('search', '•')} <b>Searching...</b>", parse_mode=ParseMode.HTML)
     data = await lookup_vehicle(reg)
-    await safe_edit_message(status, fmt_vehicle(data, reg), parse_mode=ParseMode.HTML, disable_web_page_preview=True, auto_delete_after=result_delete_seconds())
+    history_result = fmt_vehicle(data, reg)
+    save_search_result(user, history_result)
+    await safe_edit_message(status, history_result, parse_mode=ParseMode.HTML, disable_web_page_preview=True, auto_delete_after=result_delete_seconds())
 
 
 async def handle_imei(update, context, value):
@@ -1373,7 +2029,9 @@ async def handle_imei(update, context, value):
         return
     status=await safe_reply(update.effective_message, f"{ce('search','🔎')} <b>IMEI Info: searching...</b>", parse_mode=ParseMode.HTML)
     data=await lookup_imei(imei)
-    await safe_edit_message(status, fmt_imei(data, imei), parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=back_keyboard(), auto_delete_after=result_delete_seconds())
+    history_result = fmt_imei(data, imei)
+    save_search_result(user, history_result)
+    await safe_edit_message(status, history_result, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=back_keyboard(), auto_delete_after=result_delete_seconds())
 
 # =============================================================================
 # USERNAME RECON
@@ -1387,61 +2045,393 @@ PLATFORM_MAP = {
     "Snapchat": "https://www.snapchat.com/add/{}",
     "Pinterest": "https://www.pinterest.com/{}/",
     "Reddit": "https://www.reddit.com/user/{}",
+    "Tumblr": "https://{}.tumblr.com",
+    "Quora": "https://www.quora.com/profile/{}",
     "GitHub": "https://github.com/{}",
     "GitLab": "https://gitlab.com/{}",
+    "Bitbucket": "https://bitbucket.org/{}/",
     "StackOverflow": "https://stackoverflow.com/users/{}?tab=profile",
     "Dev.to": "https://dev.to/{}",
     "Medium": "https://medium.com/@{}",
+    "HackerNews": "https://news.ycombinator.com/user?id={}",
+    "CodePen": "https://codepen.io/{}",
+    "Replit": "https://replit.com/@{}",
+    "LeetCode": "https://leetcode.com/{}/",
     "YouTube": "https://www.youtube.com/@{}",
     "Twitch": "https://www.twitch.tv/{}",
+    "Vimeo": "https://vimeo.com/{}",
     "SoundCloud": "https://soundcloud.com/{}",
+    "Spotify": "https://open.spotify.com/user/{}",
+    "Bandcamp": "https://bandcamp.com/{}",
+    "Mixcloud": "https://www.mixcloud.com/{}/",
+    "AngelList": "https://angel.co/u/{}",
+    "Crunchbase": "https://www.crunchbase.com/person/{}",
+    "Behance": "https://www.behance.net/{}",
+    "Dribbble": "https://dribbble.com/{}",
     "Discord": "https://discord.com/users/{}",
     "Telegram": "https://t.me/{}",
+    "Mastodon": "https://mastodon.social/@{}",
     "Threads": "https://www.threads.net/@{}",
+    "Bluesky": "https://bsky.app/profile/{}.bsky.social",
+    "Etsy": "https://www.etsy.com/shop/{}",
+    "eBay": "https://www.ebay.com/usr/{}",
     "Steam": "https://steamcommunity.com/id/{}",
+    "Xbox": "https://account.xbox.com/en-us/profile?gamertag={}",
+    "PlayStation": "https://my.playstation.com/profile/{}",
+    "Roblox": "https://www.roblox.com/user.aspx?username={}",
+    "Minecraft": "https://namemc.com/profile/{}",
+    "Linktree": "https://linktr.ee/{}",
+    "Carrd": "https://{}.carrd.co",
+    "About.me": "https://about.me/{}",
+    "Gravatar": "https://en.gravatar.com/{}",
+    "WordPress": "https://{}.wordpress.com",
+    "Wix": "https://{}.wixsite.com",
+    "Wattpad": "https://www.wattpad.com/user/{}",
+    "Goodreads": "https://www.goodreads.com/{}",
+    "Strava": "https://www.strava.com/athletes/{}",
+    "Flickr": "https://www.flickr.com/people/{}/",
+    "500px": "https://500px.com/p/{}",
+    "Unsplash": "https://unsplash.com/@{}",
+    "Kaggle": "https://www.kaggle.com/{}",
+    "ProductHunt": "https://www.producthunt.com/@{}",
+    # --- Naye add kiye ---
+    "Keybase": "https://keybase.io/{}",
+    "Patreon": "https://www.patreon.com/{}",
+    "Ko-fi": "https://ko-fi.com/{}",
+    "BuyMeACoffee": "https://www.buymeacoffee.com/{}",
+    "Gumroad": "https://{}.gumroad.com",
+    "Substack": "https://{}.substack.com",
+    "VK": "https://vk.com/{}",
+    "OK.ru": "https://ok.ru/{}",
+    "Weibo": "https://weibo.com/{}",
+    "Douyin": "https://www.douyin.com/user/{}",
+    "Line": "https://line.me/ti/p/{}",
+    "Kik": "https://kik.me/{}",
+    "Skype": "https://join.skype.com/invite/{}",
+    "IMDb": "https://www.imdb.com/user/{}",
+    "Letterboxd": "https://letterboxd.com/{}",
+    "MyAnimeList": "https://myanimelist.net/profile/{}",
+    "AniList": "https://anilist.co/user/{}",
+    "Chess.com": "https://www.chess.com/member/{}",
+    "Lichess": "https://lichess.org/@/{}",
+    "Duolingo": "https://www.duolingo.com/profile/{}",
+    "Codeforces": "https://codeforces.com/profile/{}",
+    "HackerRank": "https://www.hackerrank.com/{}",
+    "CodeChef": "https://www.codechef.com/users/{}",
+    "TopCoder": "https://www.topcoder.com/members/{}",
+    "npm": "https://www.npmjs.com/~{}",
+    "PyPI": "https://pypi.org/user/{}",
+    "Docker Hub": "https://hub.docker.com/u/{}",
+    "SourceForge": "https://sourceforge.net/u/{}",
+    "F6S": "https://www.f6s.com/{}",
+    "Fiverr": "https://www.fiverr.com/{}",
+    "Upwork": "https://www.upwork.com/freelancers/{}",
+    "TripAdvisor": "https://www.tripadvisor.com/members/{}",
+    "Houzz": "https://www.houzz.com/user/{}",
+    "OnlyFans": "https://onlyfans.com/{}",
+    "Venmo": "https://venmo.com/{}",
+    "CashApp": "https://cash.app/${}",
+    "PayPal.me": "https://paypal.me/{}",
+    "Signal": "https://signal.me/#p/{}",
+    "WhatsApp": "https://wa.me/{}",
+    "Slack": "https://{}.slack.com",
+    "Notion": "https://www.notion.so/{}",
+    "Trello": "https://trello.com/{}",
+    "Figma": "https://www.figma.com/@{}",
+    "Blogger": "https://{}.blogspot.com",
+    "Blogspot": "https://{}.blogspot.com",
+    "LiveJournal": "https://{}.livejournal.com",
+    "Vine": "https://vine.co/u/{}",
+    "Peloton": "https://members.onepeloton.com/profile/{}",
+    "MyFitnessPal": "https://www.myfitnesspal.com/profile/{}",
+    "Untappd": "https://untappd.com/user/{}",
+    "Last.fm": "https://www.last.fm/user/{}",
+    "Genius": "https://genius.com/{}",
+    "SoundCloud Go": "https://soundcloud.com/{}",
+    "AllTrails": "https://www.alltrails.com/members/{}",
 }
+
+PLATFORMS_PER_PAGE = 15
+PLATFORMS_PER_ROW = 3
+
+recon_cache = {}  # msg_id -> {"username": str, "found": [...], "user_id": int}
+
+
+PLATFORM_STYLE = {
+    "Instagram": ("spark", "primary"),
+    "Twitter/X": ("bolt", "primary"),
+    "TikTok": ("spark", "primary"),
+    "Facebook": ("spark", "primary"),
+    "LinkedIn": ("card", "primary"),
+    "Snapchat": ("spark", "primary"),
+    "Pinterest": ("spark", "primary"),
+    "Reddit": ("users", "primary"),
+    "Tumblr": ("spark", "primary"),
+    "Quora": ("users", "primary"),
+    "GitHub": ("tools", "primary"),
+    "GitLab": ("tools", "primary"),
+    "Bitbucket": ("tools", "primary"),
+    "StackOverflow": ("tools", "primary"),
+    "Dev.to": ("tools", "primary"),
+    "Medium": ("spark", "primary"),
+    "HackerNews": ("tools", "primary"),
+    "CodePen": ("tools", "primary"),
+    "Replit": ("tools", "primary"),
+    "LeetCode": ("tools", "primary"),
+    "YouTube": ("globe", "primary"),
+    "Twitch": ("fire", "danger"),
+    "Vimeo": ("globe", "primary"),
+    "SoundCloud": ("globe", "primary"),
+    "Spotify": ("globe", "primary"),
+    "Bandcamp": ("globe", "primary"),
+    "Mixcloud": ("globe", "primary"),
+    "AngelList": ("card", "primary"),
+    "Crunchbase": ("card", "primary"),
+    "Behance": ("spark", "primary"),
+    "Dribbble": ("spark", "primary"),
+    "Discord": ("fire", "danger"),
+    "Telegram": ("phone", "success"),
+    "Mastodon": ("spark", "primary"),
+    "Threads": ("spark", "primary"),
+    "Bluesky": ("spark", "primary"),
+    "Etsy": ("gift", "success"),
+    "eBay": ("gift", "success"),
+    "Steam": ("fire", "danger"),
+    "Xbox": ("fire", "danger"),
+    "PlayStation": ("fire", "danger"),
+    "Roblox": ("fire", "danger"),
+    "Minecraft": ("fire", "danger"),
+    "Linktree": ("database", "primary"),
+    "Carrd": ("database", "primary"),
+    "About.me": ("database", "primary"),
+    "Gravatar": ("database", "primary"),
+    "WordPress": ("database", "primary"),
+    "Wix": ("database", "primary"),
+    "Wattpad": ("star", "primary"),
+    "Goodreads": ("star", "primary"),
+    "Strava": ("speed", "success"),
+    "Flickr": ("spark", "primary"),
+    "500px": ("spark", "primary"),
+    "Unsplash": ("spark", "primary"),
+    "Kaggle": ("tools", "primary"),
+    "ProductHunt": ("card", "primary"),
+    "Keybase": ("shield", "success"),
+    "Patreon": ("gift", "success"),
+    "Ko-fi": ("gift", "success"),
+    "BuyMeACoffee": ("gift", "success"),
+    "Gumroad": ("gift", "success"),
+    "Substack": ("spark", "primary"),
+    "VK": ("spark", "primary"),
+    "OK.ru": ("spark", "primary"),
+    "Weibo": ("spark", "primary"),
+    "Douyin": ("spark", "primary"),
+    "Line": ("phone", "success"),
+    "Kik": ("phone", "success"),
+    "Skype": ("phone", "success"),
+    "IMDb": ("star", "primary"),
+    "Letterboxd": ("star", "primary"),
+    "MyAnimeList": ("star", "primary"),
+    "AniList": ("star", "primary"),
+    "Chess.com": ("fire", "danger"),
+    "Lichess": ("fire", "danger"),
+    "Duolingo": ("star", "primary"),
+    "Codeforces": ("tools", "primary"),
+    "HackerRank": ("tools", "primary"),
+    "CodeChef": ("tools", "primary"),
+    "TopCoder": ("tools", "primary"),
+    "npm": ("tools", "primary"),
+    "PyPI": ("tools", "primary"),
+    "Docker Hub": ("tools", "primary"),
+    "SourceForge": ("tools", "primary"),
+    "F6S": ("card", "primary"),
+    "Fiverr": ("card", "primary"),
+    "Upwork": ("card", "primary"),
+    "TripAdvisor": ("card", "primary"),
+    "Houzz": ("card", "primary"),
+    "OnlyFans": ("lock", "danger"),
+    "Venmo": ("gift", "success"),
+    "CashApp": ("gift", "success"),
+    "PayPal.me": ("gift", "success"),
+    "Signal": ("phone", "success"),
+    "WhatsApp": ("phone", "success"),
+    "Slack": ("phone", "success"),
+    "Notion": ("database", "primary"),
+    "Trello": ("database", "primary"),
+    "Figma": ("database", "primary"),
+    "Blogger": ("database", "primary"),
+    "Blogspot": ("database", "primary"),
+    "LiveJournal": ("database", "primary"),
+    "Vine": ("spark", "primary"),
+    "Peloton": ("speed", "success"),
+    "MyFitnessPal": ("speed", "success"),
+    "Untappd": ("star", "primary"),
+    "Last.fm": ("globe", "primary"),
+    "Genius": ("globe", "primary"),
+    "SoundCloud Go": ("globe", "primary"),
+    "AllTrails": ("speed", "success"),
+}
+
+
+def build_platform_keyboard(found, page, cache_key):
+    rows = []
+    start = page * PLATFORMS_PER_PAGE
+    page_items = found[start:start + PLATFORMS_PER_PAGE]
+
+    for i in range(0, len(page_items), PLATFORMS_PER_ROW):
+        row = []
+        for p in page_items[i:i + PLATFORMS_PER_ROW]:
+            emoji_name, style = PLATFORM_STYLE.get(p["platform"], ("link", "primary"))
+            row.append(
+                modern_button(
+                    p["platform"],
+                    url=p["url"],
+                    style=style,
+                    emoji_name=emoji_name,
+                )
+            )
+        rows.append(row)
+
+    total_pages = max(1, math.ceil(len(found) / PLATFORMS_PER_PAGE))
+    nav = []
+    if page > 0:
+        nav.append(
+            modern_button(
+                "Previous",
+                f"plat_page:{cache_key}:{page - 1}",
+                style="primary",
+                emoji_name="search"
+            )
+        )
+    if page < total_pages - 1:
+        nav.append(
+            modern_button(
+                "Next",
+                f"plat_page:{cache_key}:{page + 1}",
+                style="primary",
+                emoji_name="search"
+            )
+        )
+    if nav:
+        rows.append(nav)
+
+    rows.append([
+        modern_button(
+            "Home",
+            "home",
+            style="primary",
+            emoji_name="star"
+        )
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def build_recon_text(username, found, total, page, total_pages):
+    hit_rate = f"{len(found)}/{total}"
+    success_rate = int((len(found) / total) * 100) if total else 0
+    lines = [
+        f"{ce('crown', '•')} <b>USERNAME RECON</b>",
+        "━━━━━━━━━━━━━━━",
+        f"{ce('target', '•')} <b>Target</b> » <code>{esc(username)}</code>",
+        f"{ce('globe', '•')} <b>Scanned</b> » <b>{total}</b> platforms",
+        f"{ce('verified', '•')} <b>Hits</b> » <b>{hit_rate}</b>",
+        f"{ce('bolt', '•')} <b>Success Rate</b> » <b>{success_rate}%</b>",
+        "━━━━━━━━━━━━━━━",
+    ]
+    if found:
+        lines.append(f"{ce('spark', '•')} <b>Page {page + 1}/{total_pages}</b> — tap a platform to open profile")
+    else:
+        lines.append(f"{ce('lock', '•')} No public profiles found.")
+    return "\n".join(lines)
+
 
 async def handle_user(update, context, value):
     username = value.split()[0].lstrip("@")
     if not username:
         await safe_reply(update.effective_message, f"{ce('lock', '•')} <b>Invalid username.</b>", parse_mode=ParseMode.HTML)
         return
+
     user, allowed, reason = search_gate(update, module="user", target=username)
     if not allowed:
         await safe_reply(update.effective_message, f"{ce('lock', '•')} <b>{'Banned.' if reason == 'banned' else 'Daily limit reached.'}</b>", parse_mode=ParseMode.HTML)
         return
-    status = await safe_reply(update.effective_message, f"{ce('search', '•')} <b>Scanning platforms...</b>", parse_mode=ParseMode.HTML)
+
+    status = await safe_reply(
+        update.effective_message,
+        f"{ce('rocket', '•')} <b>Initializing scan...</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36"}
+    total = len(PLATFORM_MAP)
     found = []
+    done = 0
+    lock = asyncio.Lock()
+
     async def check(name, url):
+        nonlocal done
         try:
             t = aiohttp.ClientTimeout(total=8)
             async with aiohttp.ClientSession(timeout=t, headers=headers) as s:
                 async with s.head(url, allow_redirects=True, ssl=False) as resp:
-                    if resp.status == 200:
-                        return {"platform": name, "url": url}
+                    result = {"platform": name, "url": url} if resp.status == 200 else None
         except Exception:
-            return None
-        return None
-    tasks = [check(name, url.format(username)) for name, url in PLATFORM_MAP.items()]
-    results = await asyncio.gather(*tasks)
-    for r in results:
-        if r:
-            found.append(r)
-    lines = [
-        f"{ce('user', '•')} <b>USERNAME RECON</b>",
-        "",
-        f"{ce('target', '•')} <b>Target:</b> <code>{esc(username)}</code>",
-        f"{ce('search', '•')} <b>Scanned:</b> {len(PLATFORM_MAP)}",
-        f"{ce('check', '•')} <b>Found:</b> {len(found)}",
-        "",
-    ]
-    for p in found:
-        lines.append(f"{ce('check', '•')} <a href=\"{esc(p['url'])}\">{esc(p['platform'])}</a>")
-    if not found:
-        lines.append(f"{ce('lock', '•')} No public profiles found.")
-    await safe_edit_message(status, "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True, auto_delete_after=result_delete_seconds())
+            result = None
+        async with lock:
+            done += 1
+            if result:
+                found.append(result)
+        return result
 
+    task_objs = [asyncio.ensure_future(check(name, url.format(username))) for name, url in PLATFORM_MAP.items()]
+
+    async def progress_ticker():
+        while not all(t.done() for t in task_objs):
+            filled = int((done / total) * 12) if total else 0
+            bar = "▰" * filled + "▱" * (12 - filled)
+            pct = int((done / total) * 100) if total else 0
+            text = (
+                f"{ce('search', '•')} <b>SCANNING PLATFORMS</b>\n"
+                f"<code>{bar}</code>  <b>{pct}%</b>\n"
+                f"{ce('target', '•')} <code>{esc(username)}</code>\n"
+                f"{ce('database', '•')} Checked » <b>{done}/{total}</b>   "
+                f"{ce('check', '•')} Hits » <b>{len(found)}</b>"
+            )
+            try:
+                await safe_edit_message(status, text, parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+            await asyncio.sleep(1.3)
+
+    ticker = asyncio.ensure_future(progress_ticker())
+    await asyncio.gather(*task_objs)
+    ticker.cancel()
+
+    keyboard = None
+    if found:
+        ordered = sorted(found, key=lambda p: p["platform"])
+        cache_key = str(status.message_id)
+        recon_cache[cache_key] = {
+            "username": username,
+            "found": ordered,
+            "total": total,
+            "user_id": update.effective_user.id,
+        }
+        total_pages = max(1, math.ceil(len(ordered) / PLATFORMS_PER_PAGE))
+        keyboard = build_platform_keyboard(ordered, 0, cache_key)
+        history_result = build_recon_text(username, ordered, total, 0, total_pages)
+    else:
+        history_result = build_recon_text(username, [], total, 0, 1)
+
+    save_search_result(user, history_result)
+    await safe_edit_message(
+        status,
+        history_result,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=keyboard,
+        auto_delete_after=result_delete_seconds(),
+    )
 # =============================================================================
 # NETWORK INTEL
 # =============================================================================
@@ -1465,7 +2455,9 @@ async def handle_target(update, context, value):
         ip = await loop.run_in_executor(None, socket.gethostbyname, target)
         lines.append(f"{ce('globe', '•')} <b>IP:</b> <code>{esc(ip)}</code>")
     except Exception:
-        await safe_edit_message(status, f"• Could not resolve <code>{esc(target)}</code>", parse_mode=ParseMode.HTML)
+        history_result = f"• Could not resolve <code>{esc(target)}</code>"
+        save_search_result(user, history_result)
+        await safe_edit_message(status, history_result, parse_mode=ParseMode.HTML, auto_delete_after=result_delete_seconds())
         return
     try:
         t = aiohttp.ClientTimeout(total=10)
@@ -1509,7 +2501,9 @@ async def handle_target(update, context, value):
         lines.append(f"{ce('check', '•')} <b>Port {r['port']}</b> ({r['service']}) — OPEN")
     if not open_ports:
         lines.append(f"{ce('lock', '•')} No open ports detected")
-    await safe_edit_message(status, "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True, auto_delete_after=result_delete_seconds())
+    history_result = "\n".join(lines)
+    save_search_result(user, history_result)
+    await safe_edit_message(status, history_result, parse_mode=ParseMode.HTML, disable_web_page_preview=True, auto_delete_after=result_delete_seconds())
 
 # =============================================================================
 # EMAIL & PHONE
@@ -1542,7 +2536,9 @@ async def handle_email(update, context, value):
         f"{ce('analytics', '•')} <b>Disposable:</b> {'•• Yes' if disposable else '• No'}",
         f"{ce('database', '•')} <b>MX Records:</b> {esc(', '.join(mx)) if mx else '• None'}",
     ]
-    await safe_edit_message(status, "\n".join(lines), parse_mode=ParseMode.HTML, disable_web_page_preview=True, auto_delete_after=result_delete_seconds())
+    history_result = "\n".join(lines)
+    save_search_result(user, history_result)
+    await safe_edit_message(status, history_result, parse_mode=ParseMode.HTML, disable_web_page_preview=True, auto_delete_after=result_delete_seconds())
 
 # =============================================================================
 # DARK WEB DEMO
@@ -1558,6 +2554,7 @@ async def handle_darkweb(update, context, value):
         f"{ce('shield', '•')} This is a simulated demo only.\n"
         f"{ce('lock', '•')} No Tor crawling or credential/breach-dump access."
     )
+    save_search_result(user, text)
     result = await safe_reply(update.effective_message, text, parse_mode=ParseMode.HTML)
     schedule_message_delete(result, result_delete_seconds())
 
@@ -1597,9 +2594,984 @@ async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         if "Make" in exif or "Model" in exif:
             lines.append(f"{ce('phone', '•')} <b>Device:</b> {esc(exif.get('Make', ''))} {esc(exif.get('Model', ''))}")
-        await safe_edit_message(status, "\n".join(lines), parse_mode=ParseMode.HTML, auto_delete_after=result_delete_seconds())
+        history_result = "\n".join(lines)
+        save_search_result(user, history_result)
+        await safe_edit_message(status, history_result, parse_mode=ParseMode.HTML, auto_delete_after=result_delete_seconds())
     except Exception as e:
-        await safe_edit_message(status, f"• <b>Failed:</b> <code>{esc(str(e))}</code>", parse_mode=ParseMode.HTML, auto_delete_after=result_delete_seconds())
+        history_result = f"• <b>Failed:</b> <code>{esc(str(e))}</code>"
+        save_search_result(user, history_result)
+        await safe_edit_message(status, history_result, parse_mode=ParseMode.HTML, auto_delete_after=result_delete_seconds())
+
+
+# =============================================================================
+# MULTI-BOT MANAGER / CLONE CONTROL CENTER
+# =============================================================================
+# The manager is deliberately isolated from the lookup modules.  Each clone is
+# a complete copy of this file with its own working directory, .env and
+# database.json.  Main admins are inherited into every clone; clone admins are
+# stored centrally and injected into the clone environment on every start.
+
+CLONE_MODE = os.getenv("CLONE_MODE", "0") == "1"
+CLONES_ROOT = BASE_DIR / "clones"
+CLONE_MANAGER_FILE = BASE_DIR / "clone_manager.json"
+CLONE_SOURCE_FILE = Path(__file__).resolve()
+CLONE_PAGE_SIZE = 6
+CLONE_LOG_LINES = 80
+_manager_lock = asyncio.Lock()
+_manager_cache = None
+_clone_processes = {}
+_clone_watchers = {}
+
+
+def _manager_default():
+    return {
+        "version": 2,
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+        "clones": {},
+    }
+
+
+def _manager_load(force=False):
+    global _manager_cache
+    if _manager_cache is not None and not force:
+        return _manager_cache
+    try:
+        if CLONE_MANAGER_FILE.exists():
+            with open(CLONE_MANAGER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("manager state is not an object")
+        else:
+            data = _manager_default()
+        data.setdefault("version", 2)
+        data.setdefault("created_at", now_iso())
+        data.setdefault("updated_at", now_iso())
+        data.setdefault("clones", {})
+        if not isinstance(data["clones"], dict):
+            data["clones"] = {}
+        _manager_cache = data
+        return data
+    except Exception:
+        logger.exception("Clone manager state load failed; using empty state")
+        _manager_cache = _manager_default()
+        return _manager_cache
+
+
+def _manager_atomic_write(data):
+    data["updated_at"] = now_iso()
+    tmp = CLONE_MANAGER_FILE.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CLONE_MANAGER_FILE)
+    try:
+        os.chmod(CLONE_MANAGER_FILE, 0o600)
+    except Exception:
+        pass
+
+
+async def _manager_save(data):
+    global _manager_cache
+    async with _manager_lock:
+        _manager_atomic_write(data)
+        _manager_cache = data
+
+
+def _safe_clone_id(value):
+    value = re.sub(r"[^a-zA-Z0-9_-]", "", str(value or ""))
+    return value[:40]
+
+
+def _clone_path(clone_id):
+    clone_id = _safe_clone_id(clone_id)
+    return CLONES_ROOT / clone_id
+
+
+def _pid_alive(pid):
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _clone_status(meta):
+    pid = meta.get("pid")
+    if pid and _pid_alive(pid):
+        return "running"
+    if meta.get("status") == "starting":
+        return "stopped"
+    return "stopped"
+
+
+def _main_admin_ids():
+    return sorted(set(int(x) for x in ADMIN_USER_IDS))
+
+
+def _effective_clone_admins(meta):
+    clone_admins = []
+    for x in meta.get("admins", []):
+        try:
+            clone_admins.append(int(x))
+        except Exception:
+            pass
+    return sorted(set(_main_admin_ids() + clone_admins))
+
+
+def _parse_env_file(path):
+    result = {}
+    if not path.exists():
+        return result
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            result[k] = v
+    except Exception:
+        logger.exception("Could not read clone env: %s", path)
+    return result
+
+
+def _write_clone_env(meta):
+    path = _clone_path(meta["id"])
+    path.mkdir(parents=True, exist_ok=True)
+    env_path = path / ".env"
+    old = _parse_env_file(env_path)
+    values = dict(old)
+    values.update({
+        "TELEGRAM_BOT_TOKEN": str(meta.get("token", "")),
+        "ADMIN_IDS": ",".join(str(x) for x in _effective_clone_admins(meta)),
+        "BOT_USERNAME": str(meta.get("username", "")),
+        "CLONE_MODE": "1",
+        "CLONE_ID": str(meta["id"]),
+    })
+    # The clone inherits API/configuration environment from the main bot only
+    # when those values already exist in the manager process environment.
+    for key in (
+        "FREE_GROUP_ID", "DAILY_SEARCH_LIMIT", "REFERRAL_BONUS",
+        "TG_API_KEY", "TG_API_URL", "AADHAR_API_KEY", "AADHAR_API_URL",
+        "AERIVUE_API_KEY", "AERIVUE_URL", "TURTLEMINT_API_KEY", "TURTLEMINT_URL",
+        "VEHICLE_API_URL", "IMEI_API_URL", "API_TIMEOUT_SECONDS",
+        "AUTO_DELETE_USER_SECONDS", "AUTO_DELETE_RESULT_SECONDS",
+    ):
+        if key in os.environ:
+            values[key] = os.environ[key]
+    lines = []
+    for k, v in values.items():
+        if v is None:
+            continue
+        # .env values are single-line and never need shell interpolation here.
+        lines.append(f"{k}={str(v).replace(chr(10), '')}")
+    tmp = env_path.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, env_path)
+    try:
+        os.chmod(env_path, 0o600)
+    except Exception:
+        pass
+
+
+def _ensure_clone_source(meta):
+    path = _clone_path(meta["id"])
+    path.mkdir(parents=True, exist_ok=True)
+    target = path / "prime5d.py"
+    # Copy the exact currently running source. This keeps clones feature-identical.
+    if (not target.exists()
+            or target.stat().st_size != CLONE_SOURCE_FILE.stat().st_size
+            or target.stat().st_mtime_ns != CLONE_SOURCE_FILE.stat().st_mtime_ns):
+        import shutil
+        shutil.copy2(CLONE_SOURCE_FILE, target)
+    # Separate DB is created by the copied bot in this directory.
+    return target
+
+
+def _clone_log_path(meta):
+    return _clone_path(meta["id"]) / "bot.log"
+
+
+def _terminate_pid(pid, force=False):
+    """Terminate a clone process in a Windows/Linux-safe way."""
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if pid <= 0 or not _pid_alive(pid):
+        return True
+    try:
+        if os.name == "nt":
+            # Do not send Ctrl+C to the console: that can turn into
+            # KeyboardInterrupt inside the clone. taskkill is isolated and
+            # also handles the clone's child processes.
+            cmd = ["taskkill", "/PID", str(pid), "/T", "/F"]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            return not _pid_alive(pid)
+        os.kill(pid, 9 if force else 15)
+        return True
+    except Exception:
+        logger.exception("Could not terminate clone PID %s", pid)
+        return False
+
+
+async def _watch_clone_process(meta, proc, log):
+    """Keep manager state accurate when a clone exits by itself."""
+    clone_id = meta["id"]
+    pid = proc.pid
+    try:
+        rc = await proc.wait()
+        if meta.get("pid") == pid:
+            meta["pid"] = None
+            meta["last_exit_code"] = rc
+            meta["status"] = "stopped" if rc == 0 else "crashed"
+            if rc != 0:
+                meta["last_error"] = f"Clone exited with code {rc}. Check bot.log."
+            await _manager_save(_manager_load())
+            logger.warning("Clone %s exited (PID %s, code %s)", clone_id, pid, rc)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Clone watcher failed for %s", clone_id)
+    finally:
+        _clone_processes.pop(clone_id, None)
+        _clone_watchers.pop(clone_id, None)
+        try:
+            log.close()
+        except Exception:
+            pass
+
+
+async def _clone_start(meta):
+    clone_id = meta["id"]
+    path = _clone_path(clone_id)
+    _ensure_clone_source(meta)
+    _write_clone_env(meta)
+
+    current = meta.get("pid")
+    if current and _pid_alive(current):
+        meta["status"] = "running"
+        return True, "Already running."
+    meta["pid"] = None
+
+    # Prevent two rapid button presses from spawning two clone processes.
+    existing_proc = _clone_processes.get(clone_id)
+    if existing_proc and existing_proc.returncode is None:
+        meta["pid"] = existing_proc.pid
+        meta["status"] = "running"
+        return True, "Already starting/running."
+
+    log_path = _clone_log_path(meta)
+    log = open(log_path, "a", encoding="utf-8", buffering=1)
+    log.write(f"\n[{now_iso()}] ===== CLONE START REQUEST =====\n")
+    log.flush()
+
+    env = os.environ.copy()
+    env.update(_parse_env_file(path / ".env"))
+    env["CLONE_MODE"] = "1"
+    env["CLONE_ID"] = clone_id
+    env["TELEGRAM_BOT_TOKEN"] = str(meta.get("token", ""))
+    env["ADMIN_IDS"] = ",".join(str(x) for x in _effective_clone_admins(meta))
+    env["BOT_USERNAME"] = str(meta.get("username", ""))
+
+    kwargs = dict(
+        cwd=str(path),
+        env=env,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=log,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    if os.name == "nt":
+        # Give every clone its own Windows process group and no shared console.
+        # This is the key fix for Ctrl+C from the main bot terminating clones.
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        kwargs["creationflags"] = flags
+    else:
+        kwargs["start_new_session"] = True
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(path / "prime5d.py"), **kwargs
+        )
+    except Exception as e:
+        log.close()
+        meta["status"] = "error"
+        meta["pid"] = None
+        meta["last_error"] = str(e)[:500]
+        await _manager_save(_manager_load())
+        return False, f"Start failed: {e}"
+
+    _clone_processes[clone_id] = proc
+    meta["pid"] = proc.pid
+    meta["status"] = "starting"
+    meta["last_started_at"] = now_iso()
+    meta.pop("last_error", None)
+    await _manager_save(_manager_load())
+
+    watcher = asyncio.create_task(_watch_clone_process(meta, proc, log))
+    _clone_watchers[clone_id] = watcher
+
+    # Give Python/Telegram a moment to initialize, then detect immediate exits
+    # instead of falsely reporting the clone as running.
+    await asyncio.sleep(2.0)
+    if proc.returncode is not None:
+        tail = _read_log(meta, 20)
+        meta["pid"] = None
+        meta["status"] = "crashed" if proc.returncode != 0 else "stopped"
+        meta["last_exit_code"] = proc.returncode
+        meta["last_error"] = tail[-800:] if tail else f"Exited with code {proc.returncode}."
+        await _manager_save(_manager_load())
+        return False, f"Clone exited during startup (code {proc.returncode}). Check Logs."
+
+    meta["status"] = "running"
+    await _manager_save(_manager_load())
+    return True, f"Started (PID {proc.pid})."
+
+
+async def _clone_stop(meta, force=False):
+    clone_id = meta["id"]
+    pid = meta.get("pid")
+    watcher = _clone_watchers.get(clone_id)
+    if watcher and not watcher.done():
+        # Let the process exit naturally after taskkill/terminate; watcher state
+        # is guarded by PID so an old process cannot overwrite a newer start.
+        pass
+    if pid and _pid_alive(pid):
+        _terminate_pid(pid, force=force)
+        for _ in range(12):
+            await asyncio.sleep(0.25)
+            if not _pid_alive(pid):
+                break
+        if _pid_alive(pid):
+            _terminate_pid(pid, force=True)
+    proc = _clone_processes.get(clone_id)
+    if proc and proc.returncode is not None:
+        _clone_processes.pop(clone_id, None)
+    meta["pid"] = None
+    meta["status"] = "stopped"
+    meta["last_stopped_at"] = now_iso()
+    await _manager_save(_manager_load())
+    return True
+
+
+async def _clone_restart(meta):
+    await _clone_stop(meta)
+    return await _clone_start(meta)
+
+
+async def _clone_sync_admins(meta):
+    _write_clone_env(meta)
+    if _pid_alive(meta.get("pid")):
+        return await _clone_restart(meta)
+    meta["status"] = "stopped"
+    await _manager_save(_manager_load())
+    return True, "Saved. Clone is stopped; new admins will apply on next start."
+
+
+def _clone_meta_public(meta):
+    token = str(meta.get("token", ""))
+    username = meta.get("username") or "unknown"
+    return {
+        "id": meta.get("id"),
+        "username": username,
+        "admins": list(meta.get("admins", [])),
+        "all_admins": _effective_clone_admins(meta),
+        "status": _clone_status(meta),
+        "created_at": meta.get("created_at"),
+        "last_started_at": meta.get("last_started_at"),
+        "has_token": bool(token),
+    }
+
+
+def _clone_list():
+    state = _manager_load()
+    rows = []
+    for meta in state.get("clones", {}).values():
+        if not isinstance(meta, dict) or not meta.get("id"):
+            continue
+        rows.append(meta)
+    rows.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return rows
+
+
+def _clone_dashboard_text():
+    rows = _clone_list()
+    running = sum(_clone_status(x) == "running" for x in rows)
+    stopped = len(rows) - running
+    return (
+        f"{ce('crown', '•')} <b>BOT MANAGEMENT</b>\n\n"
+        f"{ce('tools', '•')} <b>Total clones:</b> <code>{len(rows)}</code>\n"
+        f"{ce('check', '•')} <b>Running:</b> <code>{running}</code>\n"
+        f"{ce('lock', '•')} <b>Stopped:</b> <code>{stopped}</code>\n"
+        f"{ce('users', '•')} <b>Main admins inherited:</b> <code>{len(_main_admin_ids())}</code>\n\n"
+        f"{ce('shield', '•')} Each clone has its own users, premium, history, force-join and settings.\n"
+        f"{ce('database', '•')} Clone state is cached in memory and persisted atomically."
+    )
+
+
+def _clone_manager_keyboard():
+    rows = [
+        [modern_button("Create Clone", "clone_create", style="success", emoji_name="rocket")],
+        [modern_button("My Clones", "clone_list:0", style="primary", emoji_name="tools")],
+        [modern_button("Statistics", "clone_stats", style="primary", emoji_name="analytics")],
+        [modern_button("Sync Admins", "clone_sync_all", style="primary", emoji_name="users")],
+        [modern_button("Admin Panel", "admin_panel", style="danger", emoji_name="crown")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _clone_list_keyboard(page=0):
+    rows = []
+    clones = _clone_list()
+    pages = max(1, math.ceil(len(clones) / CLONE_PAGE_SIZE))
+    page = max(0, min(int(page), pages - 1))
+    subset = clones[page * CLONE_PAGE_SIZE:(page + 1) * CLONE_PAGE_SIZE]
+    for meta in subset:
+        status = "🟢" if _clone_status(meta) == "running" else "🔴"
+        name = str(meta.get("username") or meta.get("id"))[:28]
+        rows.append([modern_button(f"{status} @{name}", f"clone_view:{meta['id']}", style="primary", emoji_name="tools")])
+    nav = []
+    if page > 0:
+        nav.append(modern_button("Prev", f"clone_list:{page-1}", style="primary", emoji_name="link"))
+    if page + 1 < pages:
+        nav.append(modern_button("Next", f"clone_list:{page+1}", style="primary", emoji_name="link"))
+    if nav:
+        rows.append(nav)
+    rows.append([modern_button("Bot Manager", "clone_manager", style="primary", emoji_name="crown")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _clone_list_text(page=0):
+    clones = _clone_list()
+    pages = max(1, math.ceil(len(clones) / CLONE_PAGE_SIZE))
+    page = max(0, min(int(page), pages - 1))
+    subset = clones[page * CLONE_PAGE_SIZE:(page + 1) * CLONE_PAGE_SIZE]
+    lines = [
+        f"{ce('tools', '•')} <b>MY CLONES</b>",
+        f"Page <code>{page+1}/{pages}</code> • Total <code>{len(clones)}</code>", ""
+    ]
+    if not subset:
+        lines.append(f"{ce('lock', '•')} No clones created yet.")
+    for i, meta in enumerate(subset, start=page * CLONE_PAGE_SIZE + 1):
+        status = "RUNNING" if _clone_status(meta) == "running" else "STOPPED"
+        lines.append(f"<b>{i}.</b> @{esc(meta.get('username') or 'unknown')} — <code>{status}</code>")
+        lines.append(f"    ID: <code>{esc(meta.get('id'))}</code> • Clone admins: <code>{len(meta.get('admins', []))}</code>")
+    return "\n".join(lines)
+
+
+def _find_clone(clone_id):
+    return _manager_load().get("clones", {}).get(_safe_clone_id(clone_id))
+
+
+def _clone_view_text(meta):
+    status = _clone_status(meta)
+    clone_admins = [str(x) for x in meta.get("admins", [])]
+    inherited = [str(x) for x in _main_admin_ids()]
+    log_path = _clone_log_path(meta)
+    log_size = log_path.stat().st_size if log_path.exists() else 0
+    return (
+        f"{ce('tools', '•')} <b>CLONE CONTROL</b>\n\n"
+        f"{ce('verified', '•')} <b>Bot:</b> @{esc(meta.get('username') or 'unknown')}\n"
+        f"{ce('id', '•')} <b>Clone ID:</b> <code>{esc(meta.get('id'))}</code>\n"
+        f"{ce('analytics', '•')} <b>Status:</b> <b>{status.upper()}</b>\n"
+        f"{ce('users', '•')} <b>Clone admins:</b> <code>{len(clone_admins)}</code>\n"
+        f"{ce('crown', '•')} <b>Inherited main admins:</b> <code>{len(inherited)}</code>\n"
+        f"{ce('database', '•')} <b>Database:</b> <code>isolated</code>\n"
+        f"{ce('tools', '•')} <b>Log:</b> <code>{log_size} bytes</code>"
+    )
+
+
+def _clone_view_keyboard(meta):
+    cid = meta["id"]
+    running = _clone_status(meta) == "running"
+    rows = []
+    if running:
+        rows.append([
+            modern_button("Stop", f"clone_stop:{cid}", style="danger", emoji_name="lock"),
+            modern_button("Restart", f"clone_restart:{cid}", style="primary", emoji_name="tools"),
+        ])
+    else:
+        rows.append([modern_button("Start", f"clone_start:{cid}", style="success", emoji_name="rocket")])
+    rows += [
+        [modern_button("Manage Admins", f"clone_admins:{cid}", style="primary", emoji_name="users")],
+        [modern_button("Force Join", f"clone_forcejoin:{cid}", style="primary", emoji_name="shield")],
+        [modern_button("Logs", f"clone_logs:{cid}", style="primary", emoji_name="tools")],
+        [modern_button("Sync Config", f"clone_sync:{cid}", style="primary", emoji_name="bolt")],
+        [modern_button("Delete Clone", f"clone_delete_confirm:{cid}", style="danger", emoji_name="lock")],
+        [modern_button("Clone List", "clone_list:0", style="primary", emoji_name="link")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _clone_admins_text(meta):
+    admins = meta.get("admins", [])
+    inherited = _main_admin_ids()
+    lines = [
+        f"{ce('users', '•')} <b>CLONE ADMINS</b>",
+        f"<b>@{esc(meta.get('username') or 'unknown')}</b>", "",
+        f"{ce('crown', '•')} <b>Main admins (inherited):</b>"
+    ]
+    if inherited:
+        lines += [f"  • <code>{x}</code>" for x in inherited]
+    else:
+        lines.append("  • none")
+    lines += ["", f"{ce('users', '•')} <b>Clone-specific admins:</b>"]
+    if admins:
+        lines += [f"  • <code>{int(x)}</code>" for x in admins]
+    else:
+        lines.append("  • none")
+    lines += ["", "Main admins cannot be removed from clones."]
+    return "\n".join(lines)
+
+
+def _clone_admins_keyboard(meta):
+    cid = meta["id"]
+    rows = []
+    for admin_id in meta.get("admins", []):
+        rows.append([modern_button(f"Remove {admin_id}", f"clone_admin_remove:{cid}:{admin_id}", style="danger", emoji_name="lock")])
+    rows.append([modern_button("➕ Add Admin", f"clone_admin_add:{cid}", style="success", emoji_name="users")])
+    rows.append([modern_button("Back", f"clone_view:{cid}", style="primary", emoji_name="link")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _clone_db_file(meta):
+    return _clone_path(meta["id"]) / "database.json"
+
+
+def _clone_db_load(meta):
+    path = _clone_db_file(meta)
+    if not path.exists():
+        data = json.loads(json.dumps(DEFAULT_DB))
+        data["settings"]["created_at"] = now_iso()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+        return data
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.setdefault("users", {})
+        data.setdefault("searches", [])
+        data.setdefault("referrals", [])
+        data.setdefault("settings", {})
+        data["settings"].setdefault("force_join", [])
+        data["settings"].setdefault("maintenance_mode", False)
+        return data
+    except Exception:
+        logger.exception("Clone DB load failed: %s", path)
+        raise
+
+
+def _clone_db_save(meta, data):
+    path = _clone_db_file(meta)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _clone_forcejoin_channels(meta):
+    db = _clone_db_load(meta)
+    channels = db.setdefault("settings", {}).setdefault("force_join", [])
+    if not isinstance(channels, list):
+        channels = []
+        db["settings"]["force_join"] = channels
+        _clone_db_save(meta, db)
+    return db, channels
+
+
+def _clone_forcejoin_text(meta):
+    _, channels = _clone_forcejoin_channels(meta)
+    lines = [
+        f"{ce('shield','•')} <b>FORCE JOIN — @{esc(meta.get('username') or 'unknown')}</b>",
+        "",
+    ]
+    if not channels:
+        lines.append("No force-join channels configured.")
+    for i, c in enumerate(channels, 1):
+        status = "ON" if c.get("enabled", True) else "OFF"
+        lines.append(f"<b>{i}.</b> {esc(c.get('title') or c.get('chat') or 'Channel')} — <code>{status}</code>")
+        lines.append(f"    <code>{esc(c.get('chat') or '')}</code>")
+    return "\n".join(lines)
+
+
+def _clone_forcejoin_keyboard(meta):
+    _, channels = _clone_forcejoin_channels(meta)
+    cid = meta["id"]
+    rows = []
+    for c in channels:
+        channel_id = str(c.get("id"))
+        label = (c.get("title") or c.get("chat") or "Channel")[:24]
+        rows.append([
+            modern_button(("Turn Off: " if c.get("enabled", True) else "Turn On: ") + label,
+                          f"clone_fj_toggle:{cid}:{channel_id}",
+                          style="success" if c.get("enabled", True) else "danger", emoji_name="shield"),
+            modern_button("Remove", f"clone_fj_remove:{cid}:{channel_id}", style="danger", emoji_name="lock")
+        ])
+    rows.append([modern_button("➕ Add Channel", f"clone_fj_add:{cid}", style="primary", emoji_name="link")])
+    rows.append([modern_button("Back", f"clone_view:{cid}", style="primary", emoji_name="link")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _clone_forcejoin_add_prompt(update, context, meta):
+    context.user_data["clone_fj_add_mode"] = meta["id"]
+    await safe_edit(
+        update.callback_query,
+        f"{ce('link','•')} <b>ADD CLONE FORCE-JOIN</b>\n\n"
+        f"Send:\n<code>chat | join_url | title</code>\n\n"
+        f"Example:\n<code>@channel | https://t.me/channel | My Channel</code>\n\n"
+        f"This is saved only inside this clone's database.\n/cancel to abort.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[modern_button("Cancel", f"clone_forcejoin:{meta['id']}", style="danger", emoji_name="lock")]])
+    )
+
+
+def _clone_forcejoin_add(meta, raw):
+    parts = [p.strip() for p in raw.split("|", 2)]
+    if len(parts) < 2:
+        raise ValueError("Format: chat | url | title")
+    chat, url = parts[0], parts[1]
+    title = parts[2] if len(parts) == 3 and parts[2] else chat
+    db, channels = _clone_forcejoin_channels(meta)
+    channels.append({
+        "id": secrets.token_hex(4),
+        "enabled": True,
+        "chat": chat[:200],
+        "url": url[:500],
+        "title": title[:100],
+    })
+    _clone_db_save(meta, db)
+
+
+def _clone_forcejoin_redirect(meta):
+    return _clone_forcejoin_text(meta)
+
+
+def _read_log(meta, lines=CLONE_LOG_LINES):
+    path = _clone_log_path(meta)
+    if not path.exists():
+        return "No log yet."
+    try:
+        data = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return "\n".join(data[-lines:])[-3500:] or "No log yet."
+    except Exception as e:
+        return f"Could not read log: {e}"
+
+
+async def clone_manager_panel(update, edit=True):
+    if not is_admin(update.effective_user.id) or CLONE_MODE:
+        if update.callback_query:
+            await update.callback_query.answer("Main-admin only", show_alert=True)
+        return
+    text = _clone_dashboard_text()
+    if edit and update.callback_query:
+        await safe_edit(update.callback_query, text, parse_mode=ParseMode.HTML, reply_markup=_clone_manager_keyboard())
+    else:
+        await safe_reply(update.effective_message, text, parse_mode=ParseMode.HTML, reply_markup=_clone_manager_keyboard())
+
+
+async def _validate_bot_token(token):
+    token = token.strip()
+    if not re.fullmatch(r"\d{5,20}:[A-Za-z0-9_-]{20,100}", token):
+        return None, "Token format looks invalid."
+    try:
+        from telegram import Bot
+        bot = Bot(token=token)
+        me = await bot.get_me()
+        try:
+            await bot.shutdown()
+        except Exception:
+            pass
+        return me, None
+    except Exception as e:
+        return None, f"Telegram rejected the token: {e}"
+
+
+async def clone_create_prompt(update, context):
+    if not is_admin(update.effective_user.id) or CLONE_MODE:
+        return
+    context.user_data["clone_create_mode"] = True
+    await safe_edit(
+        update.callback_query,
+        f"{ce('rocket', '•')} <b>CREATE CLONE BOT</b>\n\n"
+        f"Send the <b>BotFather token</b> for the new bot.\n"
+        f"The token is stored only in the manager's protected clone config and clone <code>.env</code>.\n\n"
+        f"Send /cancel to abort.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[modern_button("Cancel", "clone_manager", style="danger", emoji_name="lock")]])
+    )
+
+
+async def clone_create_from_token(update, context, token):
+    if not is_admin(update.effective_user.id) or CLONE_MODE:
+        return True
+    me, error = await _validate_bot_token(token)
+    if error:
+        await safe_reply(update.effective_message, f"{ce('lock','•')} <b>Clone not created.</b>\n\n{esc(error)}", parse_mode=ParseMode.HTML)
+        return True
+    username = me.username or f"bot_{me.id}"
+    state = _manager_load()
+    for existing in state.get("clones", {}).values():
+        if str(existing.get("token", "")) == token.strip() or int(existing.get("bot_id", 0) or 0) == int(me.id):
+            await safe_reply(update.effective_message, "• This bot token is already registered as a clone.", parse_mode=ParseMode.HTML)
+            return True
+    if token.strip() == TELEGRAM_BOT_TOKEN.strip():
+        await safe_reply(update.effective_message, "• The main bot token cannot be registered as a clone.", parse_mode=ParseMode.HTML)
+        return True
+    clone_id = _safe_clone_id(f"{me.id}_{secrets.token_hex(3)}")
+    while clone_id in state["clones"]:
+        clone_id = _safe_clone_id(f"{me.id}_{secrets.token_hex(4)}")
+    meta = {
+        "id": clone_id,
+        "bot_id": int(me.id),
+        "username": username,
+        "token": token.strip(),
+        "admins": [],
+        "status": "stopped",
+        "pid": None,
+        "created_at": now_iso(),
+        "path": str(_clone_path(clone_id)),
+    }
+    state["clones"][clone_id] = meta
+    CLONES_ROOT.mkdir(parents=True, exist_ok=True)
+    _ensure_clone_source(meta)
+    _write_clone_env(meta)
+    await _manager_save(state)
+    context.user_data.pop("clone_create_mode", None)
+    ok, msg = await _clone_start(meta)
+    await safe_reply(
+        update.effective_message,
+        f"{ce('check','•')} <b>Clone created.</b>\n\n"
+        f"{ce('verified','•')} <b>Bot:</b> @{esc(username)}\n"
+        f"{ce('id','•')} <b>Clone ID:</b> <code>{esc(clone_id)}</code>\n"
+        f"{ce('rocket','•')} <b>Process:</b> {esc(msg)}\n\n"
+        f"Main admins are inherited automatically. Clone-specific admins can be added from the control panel.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_clone_view_keyboard(meta),
+    )
+    return True
+
+
+async def clone_delete(meta):
+    await _clone_stop(meta, force=True)
+    path = _clone_path(meta["id"]).resolve()
+    root = CLONES_ROOT.resolve()
+    if root not in path.parents:
+        raise RuntimeError("Refusing to delete a path outside the clone root")
+    import shutil
+    if path.exists():
+        shutil.rmtree(path)
+    state = _manager_load()
+    state.get("clones", {}).pop(meta["id"], None)
+    await _manager_save(state)
+
+
+async def clone_callback(update, context, data):
+    q = update.callback_query
+    if CLONE_MODE or not is_admin(update.effective_user.id):
+        await q.answer("Main-admin only", show_alert=True)
+        return True
+    try:
+        if data == "clone_manager":
+            await clone_manager_panel(update)
+        elif data == "clone_create":
+            await clone_create_prompt(update, context)
+        elif data.startswith("clone_list:"):
+            page = int(data.split(":", 1)[1])
+            await safe_edit(q, _clone_list_text(page), parse_mode=ParseMode.HTML, reply_markup=_clone_list_keyboard(page))
+        elif data == "clone_stats":
+            rows = _clone_list()
+            running = sum(_clone_status(x) == "running" for x in rows)
+            admins = sum(len(x.get("admins", [])) for x in rows)
+            text = (
+                f"{ce('analytics','•')} <b>CLONE STATISTICS</b>\n\n"
+                f"Total: <code>{len(rows)}</code>\nRunning: <code>{running}</code>\nStopped: <code>{len(rows)-running}</code>\n"
+                f"Clone-specific admins: <code>{admins}</code>\nInherited main admins: <code>{len(_main_admin_ids())}</code>"
+            )
+            await safe_edit(q, text, parse_mode=ParseMode.HTML, reply_markup=_clone_manager_keyboard())
+        elif data == "clone_sync_all":
+            count = 0
+            for meta in _clone_list():
+                _write_clone_env(meta)
+                if _pid_alive(meta.get("pid")):
+                    await _clone_restart(meta)
+                count += 1
+            await safe_edit(q, f"{ce('check','•')} <b>Synced {count} clones.</b>\n\nMain admins were re-applied to every clone.", parse_mode=ParseMode.HTML, reply_markup=_clone_manager_keyboard())
+        elif data.startswith("clone_view:"):
+            meta = _find_clone(data.split(":", 1)[1])
+            if not meta:
+                await q.answer("Clone not found", show_alert=True)
+            else:
+                await safe_edit(q, _clone_view_text(meta), parse_mode=ParseMode.HTML, reply_markup=_clone_view_keyboard(meta))
+        elif data.startswith("clone_start:"):
+            meta = _find_clone(data.split(":", 1)[1])
+            if not meta:
+                await q.answer("Clone not found", show_alert=True)
+            else:
+                ok, msg = await _clone_start(meta)
+                await safe_edit(q, _clone_view_text(meta) + f"\n\n{ce('check' if ok else 'lock','•')} {esc(msg)}", parse_mode=ParseMode.HTML, reply_markup=_clone_view_keyboard(meta))
+        elif data.startswith("clone_stop:"):
+            meta = _find_clone(data.split(":", 1)[1])
+            if meta:
+                await _clone_stop(meta)
+                await safe_edit(q, _clone_view_text(meta), parse_mode=ParseMode.HTML, reply_markup=_clone_view_keyboard(meta))
+        elif data.startswith("clone_restart:"):
+            meta = _find_clone(data.split(":", 1)[1])
+            if meta:
+                ok, msg = await _clone_restart(meta)
+                await safe_edit(q, _clone_view_text(meta) + f"\n\n{esc(msg)}", parse_mode=ParseMode.HTML, reply_markup=_clone_view_keyboard(meta))
+        elif data.startswith("clone_sync:"):
+            meta = _find_clone(data.split(":", 1)[1])
+            if meta:
+                result = await _clone_sync_admins(meta)
+                msg = result[1] if isinstance(result, tuple) else "Config synced."
+                await safe_edit(q, _clone_view_text(meta) + f"\n\n{esc(msg)}", parse_mode=ParseMode.HTML, reply_markup=_clone_view_keyboard(meta))
+        elif data.startswith("clone_admins:"):
+            meta = _find_clone(data.split(":", 1)[1])
+            if meta:
+                await safe_edit(q, _clone_admins_text(meta), parse_mode=ParseMode.HTML, reply_markup=_clone_admins_keyboard(meta))
+        elif data.startswith("clone_admin_add:"):
+            cid = _safe_clone_id(data.split(":", 1)[1])
+            if not _find_clone(cid):
+                await q.answer("Clone not found", show_alert=True)
+            else:
+                context.user_data["clone_admin_add_mode"] = cid
+                await safe_edit(q, f"{ce('users','•')} <b>ADD CLONE ADMIN</b>\n\nSend the numeric Telegram user ID.\n/cancel to abort.", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[modern_button("Cancel", f"clone_admins:{cid}", style="danger", emoji_name="lock")]]))
+        elif data.startswith("clone_admin_remove:"):
+            _, cid, raw_id = data.split(":", 2)
+            meta = _find_clone(cid)
+            if meta:
+                uid = int(raw_id)
+                meta["admins"] = [int(x) for x in meta.get("admins", []) if int(x) != uid]
+                await _clone_sync_admins(meta)
+                await safe_edit(q, _clone_admins_text(meta), parse_mode=ParseMode.HTML, reply_markup=_clone_admins_keyboard(meta))
+        elif data.startswith("clone_forcejoin:"):
+            meta = _find_clone(data.split(":", 1)[1])
+            if meta:
+                await safe_edit(q, _clone_forcejoin_text(meta), parse_mode=ParseMode.HTML, reply_markup=_clone_forcejoin_keyboard(meta))
+        elif data.startswith("clone_fj_add:"):
+            meta = _find_clone(data.split(":", 1)[1])
+            if meta:
+                await _clone_forcejoin_add_prompt(update, context, meta)
+        elif data.startswith("clone_fj_toggle:"):
+            _, cid, channel_id = data.split(":", 2)
+            meta = _find_clone(cid)
+            if meta:
+                db, channels = _clone_forcejoin_channels(meta)
+                for c in channels:
+                    if str(c.get("id")) == channel_id:
+                        c["enabled"] = not c.get("enabled", True)
+                        break
+                _clone_db_save(meta, db)
+                await safe_edit(q, _clone_forcejoin_text(meta), parse_mode=ParseMode.HTML, reply_markup=_clone_forcejoin_keyboard(meta))
+        elif data.startswith("clone_fj_remove:"):
+            _, cid, channel_id = data.split(":", 2)
+            meta = _find_clone(cid)
+            if meta:
+                db, channels = _clone_forcejoin_channels(meta)
+                db["settings"]["force_join"] = [c for c in channels if str(c.get("id")) != channel_id]
+                _clone_db_save(meta, db)
+                await safe_edit(q, _clone_forcejoin_text(meta), parse_mode=ParseMode.HTML, reply_markup=_clone_forcejoin_keyboard(meta))
+        elif data.startswith("clone_logs:"):
+            meta = _find_clone(data.split(":", 1)[1])
+            if meta:
+                text = f"{ce('tools','•')} <b>CLONE LOG</b>\n\n<pre>{esc(_read_log(meta))}</pre>"
+                await safe_edit(q, text, parse_mode=ParseMode.HTML, reply_markup=_clone_view_keyboard(meta))
+        elif data.startswith("clone_delete_confirm:"):
+            cid = _safe_clone_id(data.split(":", 1)[1])
+            meta = _find_clone(cid)
+            if meta:
+                await safe_edit(q, f"{ce('lock','•')} <b>DELETE @{esc(meta.get('username'))}?</b>\n\nThis stops the process and permanently removes its isolated database, config and logs.\n\n<b>This cannot be undone from the bot.</b>", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[modern_button("YES, DELETE", f"clone_delete:{cid}", style="danger", emoji_name="lock"), modern_button("Cancel", f"clone_view:{cid}", style="primary", emoji_name="link")]]))
+        elif data.startswith("clone_delete:"):
+            meta = _find_clone(data.split(":", 1)[1])
+            if meta:
+                name = meta.get("username")
+                await clone_delete(meta)
+                await safe_edit(q, f"{ce('check','•')} <b>Clone @{esc(name)} deleted.</b>", parse_mode=ParseMode.HTML, reply_markup=_clone_manager_keyboard())
+        return True
+    except Exception as e:
+        logger.exception("Clone callback failed")
+        await q.answer("Clone manager error", show_alert=True)
+        return True
+
+
+async def clone_text_router(update, context):
+    if CLONE_MODE or not update.effective_user or not is_admin(update.effective_user.id):
+        return False
+    text = (update.effective_message.text or "").strip()
+    if context.user_data.get("clone_create_mode"):
+        if text.lower() == "/cancel":
+            context.user_data.pop("clone_create_mode", None)
+            await safe_reply(update.effective_message, "Cancelled.", reply_markup=_clone_manager_keyboard())
+            return True
+        return await clone_create_from_token(update, context, text)
+    fj_cid = context.user_data.get("clone_fj_add_mode")
+    if fj_cid:
+        if text.lower() == "/cancel":
+            context.user_data.pop("clone_fj_add_mode", None)
+            meta = _find_clone(fj_cid)
+            if meta:
+                await safe_reply(update.effective_message, _clone_forcejoin_text(meta), parse_mode=ParseMode.HTML, reply_markup=_clone_forcejoin_keyboard(meta))
+            return True
+        meta = _find_clone(fj_cid)
+        if not meta:
+            context.user_data.pop("clone_fj_add_mode", None)
+            await safe_reply(update.effective_message, "Clone no longer exists.")
+            return True
+        try:
+            _clone_forcejoin_add(meta, text)
+        except ValueError as e:
+            await safe_reply(update.effective_message, f"• <b>{esc(str(e))}</b>", parse_mode=ParseMode.HTML)
+            return True
+        context.user_data.pop("clone_fj_add_mode", None)
+        await safe_reply(update.effective_message, _clone_forcejoin_text(meta), parse_mode=ParseMode.HTML, reply_markup=_clone_forcejoin_keyboard(meta))
+        return True
+    cid = context.user_data.get("clone_admin_add_mode")
+    if cid:
+        if text.lower() == "/cancel":
+            context.user_data.pop("clone_admin_add_mode", None)
+            meta = _find_clone(cid)
+            if meta:
+                await safe_reply(update.effective_message, _clone_admins_text(meta), parse_mode=ParseMode.HTML, reply_markup=_clone_admins_keyboard(meta))
+            return True
+        if not text.lstrip("-").isdigit():
+            await safe_reply(update.effective_message, "Send a numeric Telegram user ID.", parse_mode=ParseMode.HTML)
+            return True
+        uid = int(text)
+        if uid <= 0:
+            await safe_reply(update.effective_message, "Invalid user ID.", parse_mode=ParseMode.HTML)
+            return True
+        meta = _find_clone(cid)
+        if not meta:
+            context.user_data.pop("clone_admin_add_mode", None)
+            await safe_reply(update.effective_message, "Clone no longer exists.")
+            return True
+        if uid in _main_admin_ids():
+            await safe_reply(update.effective_message, "That user is already a main admin inherited by every clone.", parse_mode=ParseMode.HTML)
+            return True
+        admins = [int(x) for x in meta.get("admins", [])]
+        if uid not in admins:
+            admins.append(uid)
+        meta["admins"] = sorted(set(admins))
+        context.user_data.pop("clone_admin_add_mode", None)
+        await _clone_sync_admins(meta)
+        await safe_reply(update.effective_message, _clone_admins_text(meta), parse_mode=ParseMode.HTML, reply_markup=_clone_admins_keyboard(meta))
+        return True
+    return False
+
+
+# Create manager state eagerly in the main process only.
+if not CLONE_MODE:
+    _manager_load()
+
 
 # =============================================================================
 # ADMIN PANEL
@@ -1637,6 +3609,7 @@ def admin_panel_keyboard():
         [
             modern_button("Force Join", "admin_forcejoin", style="primary", emoji_name="shield"),
         ],
+        *([] if CLONE_MODE else [[modern_button("Bot Management", "clone_manager", style="success", emoji_name="crown")]]),
         [
             modern_button("Close", "home", style="danger", emoji_name="lock"),
         ],
@@ -1759,6 +3732,7 @@ async def admin_user_detail(update, user_id: int):
             modern_button("Premium 7d", f"admin_premium_add:{user_id}:7", style="success", emoji_name="premium"),
             modern_button("Premium 30d", f"admin_premium_add:{user_id}:30", style="success", emoji_name="crown"),
         ])
+    rows.append([modern_button("Search History", f"admin_hist:{user_id}:0", style="primary", emoji_name="search")])
     rows.append([modern_button("Reset Limits", f"admin_reset:{user_id}", style="primary", emoji_name="bolt")])
     rows.append([modern_button("Admin Panel", "admin_panel", style="primary", emoji_name="crown")])
     await safe_edit(update.callback_query, text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
@@ -1840,6 +3814,124 @@ async def admin_forcejoin_text_handler(update: Update, context: ContextTypes.DEF
         reply_markup=force_join_admin_keyboard())
     return True
 
+HISTORY_PAGE_SIZE = 6
+
+def history_page(user_id, page=0):
+    rows = user_search_history(user_id)
+    total = len(rows)
+    pages = max(1, math.ceil(total / HISTORY_PAGE_SIZE))
+    page = max(0, min(int(page), pages - 1))
+    start = page * HISTORY_PAGE_SIZE
+    return rows[start:start + HISTORY_PAGE_SIZE], page, pages, total
+
+def history_keyboard(rows, page, pages, admin=False, user_id=None):
+    buttons = []
+    for item in rows:
+        sid = item.get("id")
+        if not sid:
+            continue
+        label = f"{search_module_label(item.get('module'))} • {str(item.get('target') or '')[:22]}"
+        cb = f"admin_hitem:{sid}" if admin else f"my_hitem:{sid}"
+        buttons.append([modern_button(label[:48], cb, style="primary", emoji_name="search")])
+    nav=[]
+    prefix = "admin_hist" if admin else "my_searches"
+    if page > 0:
+        nav.append(modern_button("Prev", f"{prefix}:{user_id}:{page-1}" if admin else f"{prefix}:{page-1}", style="primary", emoji_name="link"))
+    if page + 1 < pages:
+        nav.append(modern_button("Next", f"{prefix}:{user_id}:{page+1}" if admin else f"{prefix}:{page+1}", style="primary", emoji_name="link"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([modern_button("Back", "admin_panel" if admin else "home", style="danger", emoji_name="star")])
+    return InlineKeyboardMarkup(buttons)
+
+def format_history_list(user_id, rows, page, pages, total, admin=False):
+    title = "USER SEARCH HISTORY" if admin else "MY SEARCH HISTORY"
+    lines=[
+        f"{ce('search', '•')} <b>{title}</b>",
+        f"{ce('analytics', '•')} Page <code>{page+1}/{pages}</code> • Total <code>{total}</code>",
+        "",
+    ]
+    if not rows:
+        lines.append(f"{ce('shield', '•')} No saved searches found.")
+    for idx,item in enumerate(rows, start=page*HISTORY_PAGE_SIZE+1):
+        created=item.get("created_at") or "Unknown time"
+        module=esc(search_module_label(item.get("module")))
+        target=esc(str(item.get("target") or "")[:80])
+        lines.append(f"<b>{idx}.</b> {module} — <code>{target}</code>")
+        lines.append(f"    {esc(created)}")
+    return "\n".join(lines)
+
+def find_search_record(search_id, user_id=None):
+    for item in reversed(DB.get("searches", [])):
+        if item.get("id") != search_id:
+            continue
+        if user_id is not None and str(item.get("user_id")) != str(user_id):
+            continue
+        return item
+    return None
+
+async def show_user_history(update, context, page=0):
+    uid=update.effective_user.id
+    rows,page,pages,total=history_page(uid,page)
+    text=format_history_list(uid,rows,page,pages,total,admin=False)
+    markup=history_keyboard(rows,page,pages,admin=False)
+    q=update.callback_query
+    if update.effective_chat and update.effective_chat.type in ("group","supergroup"):
+        try:
+            await context.bot.send_message(chat_id=uid,text=text,parse_mode=ParseMode.HTML,reply_markup=markup,disable_web_page_preview=True)
+            await q.answer("Your search history was sent to your private chat.")
+        except Exception:
+            await q.answer("Start the bot in private chat first, then open My Searches.",show_alert=True)
+        return
+    await safe_edit(q,text,parse_mode=ParseMode.HTML,reply_markup=markup)
+
+async def show_search_record(update, search_id, admin=False):
+    q = update.callback_query
+    uid = None if admin else update.effective_user.id
+    item = find_search_record(search_id, uid)
+    if not item:
+        await q.answer("Search record not found.", show_alert=True)
+        return
+
+    result = item.get("result") or "• Result was not stored for this older search."
+    text = (
+        f"{ce('search','•')} <b>{'SEARCH RECORD' if admin else 'MY SEARCH'}</b>\n\n"
+        f"{ce('target','•')} <b>Module:</b> {esc(search_module_label(item.get('module')))}\n"
+        f"{ce('target','•')} <b>Target:</b> <code>{esc(item.get('target') or '')}</code>\n"
+        f"{ce('analytics','•')} <b>Searched:</b> {esc(item.get('created_at') or 'Unknown')}\n"
+        f"{ce('check','•')} <b>Completed:</b> {esc(item.get('completed_at') or 'Unknown')}\n\n"
+        f"{result}"
+    )
+
+    # Search history is private. Never render a user's result inside a group.
+    if update.effective_chat and update.effective_chat.type in ("group", "supergroup"):
+        try:
+            await update.get_bot().send_message(
+                chat_id=update.effective_user.id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([[
+                    modern_button("My Searches" if not admin else "User History",
+                                  f"my_searches:0" if not admin else f"admin_hist:{item.get('user_id')}:0",
+                                  style="primary", emoji_name="search")
+                ]]),
+            )
+            await q.answer("Private result sent to your chat.")
+        except Exception:
+            await q.answer("Open the bot in private chat first.", show_alert=True)
+        return
+
+    back_cb = f"admin_hist:{item.get('user_id')}:0" if admin else "my_searches:0"
+    await safe_edit(
+        q, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([
+            [modern_button("Back to History", back_cb, style="primary", emoji_name="search")],
+            [modern_button("Home", "admin_panel" if admin else "home", style="danger", emoji_name="star")],
+        ])
+    )
+
+
 # =============================================================================
 # CALLBACK HANDLER
 # =============================================================================
@@ -1848,9 +3940,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
     data = query.data or ""
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
     if await enforce_force_join(update):
-        return
+       return
     # Number Info button
     if data.startswith("numinfo:"):
         number = re.sub(r"\D", "", data.split(":", 1)[1])
@@ -1915,8 +4011,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
         # Back -> restore the previous Telegram lookup result.
-        if data == "back_tg":
-            previous = context.user_data.get("last_tg_result")
+    if data == "back_tg":
+        previous = context.user_data.get("last_tg_result")
         if previous:
             await safe_edit(
                 query,
@@ -1945,7 +4041,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_keyboard(),
         )
         return
-    
+
+    # -------------------------------------------------------------------------
+    # USERNAME RECON PAGINATION
+    # -------------------------------------------------------------------------
+    if data.startswith("plat_page:"):
+        _, cache_key, page_str = data.split(":")
+        page = int(page_str)
+
+        entry = recon_cache.get(cache_key)
+        if not entry:
+            await query.answer("Session expired, run the search again.", show_alert=True)
+            return
+
+        found = entry["found"]
+        total_pages = max(1, math.ceil(len(found) / PLATFORMS_PER_PAGE))
+        keyboard = build_platform_keyboard(found, page, cache_key)
+        text = build_recon_text(entry["username"], found, entry["total"], page, total_pages)
+
+        await safe_edit(
+            query,
+            text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=keyboard,
+        )
+        return
+
     # -------------------------------------------------------------------------
     # NUMBER INFO PAGINATION / DOWNLOAD / BACK
     # -------------------------------------------------------------------------
@@ -1960,37 +4082,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("num_page:"):
-        try:
-            index = int(data.split(":", 1)[1])
-        except ValueError:
-            await query.answer("Invalid page.", show_alert=True)
+            try:
+                index = int(data.split(":", 1)[1])
+            except ValueError:
+                await query.answer("Invalid page.", show_alert=True)
+                return
+
+            state = context.user_data.get("number_info") or {}
+            results = state.get("results") or []
+            number = state.get("number") or ""
+
+            if not results or not number or index < 0 or index >= len(results):
+                await query.answer("Number Info session expired.", show_alert=True)
+                return
+
+            await safe_edit(
+                query,
+                _format_number_detail(results[index], number, index, len(results)),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=_number_detail_keyboard(index, len(results), number, results)
+            )
+            schedule_message_delete(query.message, result_delete_seconds())
             return
-
-        state = context.user_data.get("number_info") or {}
-        results = state.get("results") or []
-        number = state.get("number") or ""
-
-        if not results or not number or index < 0 or index >= len(results):
-            await query.answer("Number Info session expired.", show_alert=True)
-            return
-
-        await safe_edit(
-            query,
-            f"{ce('search', '🔎')} <b>Loading result {index + 1}/{len(results)}...</b>",
-            parse_mode=ParseMode.HTML,
-        )
-
-        await asyncio.sleep(0.12)
-
-        await safe_edit(
-            query,
-            _format_number_detail(results[index], number, index, len(results)),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-            reply_markup=_number_detail_keyboard(index, len(results), number, results)
-        )
-        schedule_message_delete(query.message, result_delete_seconds())
-        return
 
     if data.startswith("num_json:"):
         state = context.user_data.get("number_info") or {}
@@ -2009,10 +4123,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             results,
             number
         )
-        clean_number = re.sub(r"\D", "", number)
+
         filename = (
             f"number_info_"
-            f"{clean_number}"
+            f"{re.sub(r'\\D', '', number)}"
             f"_all.json"
         )
 
@@ -2172,6 +4286,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit(query, home_text(user), parse_mode=ParseMode.HTML, reply_markup=main_keyboard(user))
         return
 
+    # Main-admin clone manager
+    if (data == "clone_manager" or data.startswith("clone_")) and not CLONE_MODE:
+        await clone_callback(update, context, data)
+        return
+
     # Admin
     if data.startswith("admin_") or data == "admin_panel":
         await admin_callback(update, context, data)
@@ -2181,6 +4300,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "home":
         user = ensure_user(query.from_user)
         await safe_edit(query, home_text(user), parse_mode=ParseMode.HTML, reply_markup=main_keyboard(user))
+        return
+
+    if data.startswith("my_searches:"):
+        try:
+            page = int(data.split(":", 1)[1])
+        except ValueError:
+            page = 0
+        await show_user_history(update, context, page)
+        return
+
+    if data.startswith("my_hitem:"):
+        await show_search_record(update, data.split(":", 1)[1], admin=False)
         return
 
     if data == "profile":
@@ -2237,6 +4368,14 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, dat
             await admin_users_page(update, "banned", int(data.split(":", 1)[1]))
         elif data.startswith("admin_premium:"):
             await admin_users_page(update, "premium", int(data.split(":", 1)[1]))
+        elif data.startswith("admin_hist:"):
+            _, uid, page = data.split(":")
+            uid = int(uid)
+            rows, page, pages, total = history_page(uid, int(page))
+            text = format_history_list(uid, rows, page, pages, total, admin=True)
+            await safe_edit(q, text, parse_mode=ParseMode.HTML, reply_markup=history_keyboard(rows, page, pages, admin=True, user_id=uid))
+        elif data.startswith("admin_hitem:"):
+            await show_search_record(update, data.split(":", 1)[1], admin=True)
         elif data.startswith("admin_user:"):
             await admin_user_detail(update, int(data.split(":", 1)[1]))
         elif data.startswith("admin_ban:"):
@@ -2293,7 +4432,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, dat
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([[modern_button("Cancel", "admin_panel", style="danger", emoji_name="lock")]]))
         elif data == "admin_update_restart":
-            started = launch_update_restart()
+            started = await launch_update_restart()
             if started:
                 await safe_edit(
                     q,
@@ -2386,6 +4525,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message or not update.effective_message.text:
         return
     text = update.effective_message.text.strip()
+
+    if await clone_text_router(update, context):
+        return
 
     # Admin delete timer mode
     if context.user_data.get("admin_delete_timer_mode"):
@@ -2556,7 +4698,7 @@ async def cmd_tg(update, context):
     delete_user_search_message(update)
     if await enforce_force_join(update): return
     if not context.args:
-        await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/tg 9876543210</code> or <code>/tg @username</code>", parse_mode=ParseMode.HTML)
+        await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/tg 1810011559</code> or <code>/tg @Kishan_x_73</code>", parse_mode=ParseMode.HTML)
         return
     await handle_tg(update, context, " ".join(context.args))
 
@@ -2588,7 +4730,7 @@ async def cmd_user(update, context):
     delete_user_search_message(update)
     if await enforce_force_join(update): return
     if not context.args:
-        await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/user username</code>", parse_mode=ParseMode.HTML)
+        await safe_reply(update.message, f"{ce('lock', '•')} Usage: <code>/user elonmusk</code>", parse_mode=ParseMode.HTML)
         return
     await handle_user(update, context, " ".join(context.args))
 
@@ -2627,12 +4769,21 @@ async def cmd_refer(update, context):
 async def cmd_admin(update, context):
     await show_admin_panel(update, edit=False)
 
+
+async def cmd_bots(update, context):
+    if not is_admin(update.effective_user.id) or CLONE_MODE:
+        await safe_reply(update.message, "• Main-admin only.", parse_mode=ParseMode.HTML)
+        return
+    await clone_manager_panel(update, edit=False)
+
 async def cmd_cancel(update, context):
     context.user_data.pop("pending_module", None)
     context.user_data.pop("admin_broadcast_mode", None)
     context.user_data.pop("admin_find_mode", None)
     context.user_data.pop("admin_premium_custom_mode", None)
     context.user_data.pop("admin_delete_timer_mode", None)
+    context.user_data.pop("clone_create_mode", None)
+    context.user_data.pop("clone_admin_add_mode", None)
     context.application.bot_data.setdefault("force_join_pending_admin", {}).pop(str(update.effective_user.id), None)
     await safe_reply(update.message, f"{ce('check', '•')} <b>Cancelled.</b>", parse_mode=ParseMode.HTML, reply_markup=main_keyboard(ensure_user(update.effective_user)))
 
@@ -2657,7 +4808,7 @@ def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("TELEGRAM_BOT_TOKEN missing")
         sys.exit(1)
-    logger.info("• DEMON OSINT BOT v5.1 starting...")
+    logger.info("• DEMON OSINT BOT v5.1 starting%s...", " [CLONE MODE]" if CLONE_MODE else "")
     logger.info(f"Platforms: {len(PLATFORM_MAP)} | Ports: {len(COMMON_PORTS)}")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -2675,6 +4826,7 @@ def main():
     app.add_handler(CommandHandler("profile", cmd_profile))
     app.add_handler(CommandHandler("refer", cmd_refer))
     app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("bots", cmd_bots))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
     app.add_handler(CallbackQueryHandler(button_handler))
